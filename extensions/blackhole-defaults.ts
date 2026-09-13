@@ -21,6 +21,11 @@ const PREFERRED_DEFAULTS: Record<string, unknown> = {
 	// "all model candidates exhausted" warnings on free tiers. Off until we give
 	// the workers their own models. Deterministic compaction and recall are unaffected.
 	memory: false,
+	// `compaction: "auto"` + `compactionEngine: "blackhole"` makes pi's native
+	// threshold auto-compact, overflow recovery, and `/compact` all run through
+	// blackhole's deterministic zero-LLM pipeline instead of the LLM summarizer.
+	compaction: "auto",
+	compactionEngine: "blackhole",
 };
 
 function blackholeConfigPath(): string {
