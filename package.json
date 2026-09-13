@@ -2,7 +2,9 @@
   "name": "@froooze/pi-plugins",
   "version": "0.1.0",
   "description": "Personal pi packages — extensions, skills, prompts, themes",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "type": "module",
   "pi": {
@@ -14,16 +16,22 @@
       "node_modules/pi-blackhole/index.ts",
       "node_modules/pi-subagents-lite/src/index.ts"
     ],
-    "skills": ["./skills"],
-    "prompts": ["./prompts"],
-    "themes": ["./themes"]
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ],
+    "themes": [
+      "./themes"
+    ]
   },
   "dependencies": {
-    "@baylarsadigov/omp-undo-redo": "github:froooze/omp-undo-redo#d223fb296e84df7ecec538a6338a30096cc5d0e7",
-    "@ff-labs/pi-fff": "github:froooze/fff#18ac372da0152c7c9a57ffc2613b0829621ee68e",
-    "@juicesharp/rpiv-todo": "github:froooze/rpiv-mono#1b176e47babd5420b1c26864d16200aa0ff413f2",
-    "pi-blackhole": "github:froooze/pi-blackhole#23e4a075a9d16d63108a604b94ef853f1eaecfd0",
-    "pi-subagents-lite": "github:froooze/pi-subagents-lite#88db68321e45d7c4db3d79387772a216be433eec"
+    "@baylarsadigov/omp-undo-redo": "https://github.com/froooze/omp-undo-redo/archive/2a23eb5.tar.gz",
+    "@ff-labs/pi-fff": "https://github.com/froooze/fff/archive/18ac372da0152c7c9a57ffc2613b0829621ee68e.tar.gz",
+    "@juicesharp/rpiv-todo": "https://github.com/froooze/rpiv-mono/archive/1b176e47babd5420b1c26864d16200aa0ff413f2.tar.gz",
+    "pi-blackhole": "https://github.com/froooze/pi-blackhole/archive/fb712c8.tar.gz",
+    "pi-subagents-lite": "https://github.com/froooze/pi-subagents-lite/archive/88db68321e45d7c4db3d79387772a216be433eec.tar.gz"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -31,5 +39,13 @@
     "@earendil-works/pi-tui": "*",
     "@sinclair/typebox": "*",
     "typebox": "*"
+  },
+  "allowScripts": {
+    "@baylarsadigov/omp-undo-redo@1.6.2": true,
+    "@google/genai@1.52.0": true,
+    "esbuild@0.28.1": true,
+    "protobufjs@7.6.5": true,
+    "protobufjs@7.6.6": true,
+    "pi-blackhole@0.5.3": true
   }
 }
