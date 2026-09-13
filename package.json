@@ -1,0 +1,35 @@
+{
+  "name": "@froooze/pi-plugins",
+  "version": "0.1.0",
+  "description": "Personal pi packages — extensions, skills, prompts, themes",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions",
+      "node_modules/@ff-labs/pi-fff/src/index.ts",
+      "node_modules/@juicesharp/rpiv-todo/index.ts",
+      "node_modules/@baylarsadigov/omp-undo-redo/dist/index.js",
+      "node_modules/pi-blackhole/index.ts",
+      "node_modules/pi-subagents-lite/src/index.ts"
+    ],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"],
+    "themes": ["./themes"]
+  },
+  "dependencies": {
+    "@baylarsadigov/omp-undo-redo": "github:froooze/omp-undo-redo#d223fb296e84df7ecec538a6338a30096cc5d0e7",
+    "@ff-labs/pi-fff": "github:froooze/fff#18ac372da0152c7c9a57ffc2613b0829621ee68e",
+    "@juicesharp/rpiv-todo": "github:froooze/rpiv-mono#1b176e47babd5420b1c26864d16200aa0ff413f2",
+    "pi-blackhole": "github:froooze/pi-blackhole#23e4a075a9d16d63108a604b94ef853f1eaecfd0",
+    "pi-subagents-lite": "github:froooze/pi-subagents-lite#88db68321e45d7c4db3d79387772a216be433eec"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*",
+    "typebox": "*"
+  }
+}
