@@ -97,6 +97,17 @@ export default function coloredFooter(pi: ExtensionAPI) {
 							: `${percent.toFixed(1)}%/${formatTokens(contextWindow)}`;
 					stats.push(theme.fg("mdHeading", contextText));
 
+					// Extension statuses (e.g. compact-per-model 🗜) render inline
+					// after the context stat, not on their own footer line.
+					// Sorted by key like pi's built-in footer for stable ordering.
+					const statuses = Array.from(footerData.getExtensionStatuses().entries()).sort(([a], [b]) =>
+						a.localeCompare(b),
+					);
+					for (const [, status] of statuses) {
+						const clean = status.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
+						if (clean) stats.push(clean);
+					}
+
 					const statsLeft = stats.join(" ");
 					const model = ctx.model;
 					let right = model?.id || "no-model";
@@ -131,8 +142,6 @@ export default function coloredFooter(pi: ExtensionAPI) {
 						truncateToWidth(theme.fg("dim", cwd), width),
 						truncateToWidth(statsLine, width),
 					];
-					const statuses = Array.from(footerData.getExtensionStatuses().values());
-					if (statuses.length) lines.push(truncateToWidth(statuses.join(" "), width));
 					return lines;
 				},
 			};

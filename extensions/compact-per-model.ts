@@ -206,12 +206,11 @@ export default function compactPerModel(pi: ExtensionAPI) {
 			const tokens = usage?.tokens ?? null;
 			const threshold = thresholdFor(cfg, ctx.model?.provider, ctx.model?.id);
 			if (tokens === null) {
-				ctx.ui.setStatus(STATUS_KEY, `🗜 →${formatTokens(threshold)}`);
+				ctx.ui.setStatus(STATUS_KEY, `🗜`);
 				return;
 			}
-			const window = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-			const pct = window ? ` ${((tokens / window) * 100).toFixed(0)}%` : "";
-			ctx.ui.setStatus(STATUS_KEY, `🗜${pct}→${formatTokens(threshold)}`);
+			const pct = threshold ? ` ${((tokens / threshold) * 100).toFixed(0)}%` : "";
+			ctx.ui.setStatus(STATUS_KEY, `🗜${pct}`);
 		} catch {
 			// Stale ctx — ignore.
 		}
