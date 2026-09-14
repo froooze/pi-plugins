@@ -35,6 +35,15 @@ const PREFERRED_DEFAULTS: Record<string, unknown> = {
  */
 const ENFORCED_DEFAULTS: Record<string, unknown> = {
 	memory: false,
+	// Global standard threshold (299k). An explicit `compactAfterTokens`
+	// always wins over blackhole's `compactAfterRatio` / preset curve, so
+	// pinning it here disables the built-in `default` preset (which would
+	// otherwise fire at ~189k on 272k-window models and undercut luna's
+	// 255k per-model threshold). compact-per-model carries the same 299k
+	// for 1M-window models and undercuts with 255k for luna; blackhole
+	// remains the fallback safety net and still owns the *engine*
+	// (deterministic summary) for every compaction.
+	compactAfterTokens: 299_000,
 };
 
 function blackholeConfigPath(): string {
