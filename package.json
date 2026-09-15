@@ -31,7 +31,7 @@
     "@ff-labs/pi-fff": "https://github.com/froooze/fff/archive/18ac372da0152c7c9a57ffc2613b0829621ee68e.tar.gz",
     "@juicesharp/rpiv-todo": "https://github.com/froooze/rpiv-mono/archive/1b176e47babd5420b1c26864d16200aa0ff413f2.tar.gz",
     "pi-blackhole": "https://github.com/froooze/pi-blackhole/archive/fb712c8a0607ba21cc74421f17f0fbe40d252d92.tar.gz",
-    "pi-subagents-lite": "https://github.com/froooze/pi-subagents-lite/archive/88db68321e45d7c4db3d79387772a216be433eec.tar.gz"
+    "pi-subagents-lite": "https://github.com/froooze/pi-subagents-lite/archive/1faf13eba01010d066228aa7b26b0fb23d29045e.tar.gz"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
