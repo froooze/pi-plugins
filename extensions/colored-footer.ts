@@ -81,10 +81,10 @@ export default function coloredFooter(pi: ExtensionAPI) {
 					const stats: string[] = [];
 					if (input) stats.push(theme.fg("success", `↑${formatTokens(input)}`));
 					if (output) stats.push(theme.fg("error", `↓${formatTokens(output)}`));
-					if (cacheRead) stats.push(theme.fg("muted", `R${formatTokens(cacheRead)}`));
 					if (cacheWrite) stats.push(theme.fg("muted", `W${formatTokens(cacheWrite)}`));
 					if ((cacheRead || cacheWrite) && latestCacheHitRate !== undefined) {
 						stats.push(theme.fg("warning", `CH${latestCacheHitRate.toFixed(1)}%`));
+						stats.push(theme.fg("dim", "|"));
 					}
 					if (cost) stats.push(theme.fg("text", `$${cost.toFixed(3)}`));
 
