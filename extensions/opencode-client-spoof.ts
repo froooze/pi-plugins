@@ -76,14 +76,23 @@
  *   User-Agent         -> "opencode/<version>"
  *   x-opencode-session -> a stable, well-formed OpenCode session id
  *
- * `before_provider_request` then fixes the body-level gate. On session start
- * it makes sure the request can advertise `glob` and `grep`: `glob` is
+ * `before_provider_request` then fixes the body-level gate. Before the agent
+ * starts it makes sure the request can advertise `glob` and `grep`: `glob` is
  * registered as a thin alias of Pi's built-in `find`, and the built-in `grep`
  * is registered under the `grep` name when the session does not already expose
  * one (FFF, for example, exposes `ffgrep` instead). Only for free-tier
  * `opencode` requests are those two names left in the outgoing payload's
  * `tools` array; every other request has the names we added stripped back out,
  * so no other provider sees a tool Pi would not normally send.
+ *
+ * Why `before_agent_start` and not `session_start`: extension `session_start`
+ * handlers run in load order, and this extension loads before FFF. FFF can
+ * register a tool literally named `grep` itself (its `override` mode, which
+ * replaces the built-ins instead of exposing `ffgrep`/`fffind`). Borrowing the
+ * name first and then re-registering by name on teardown would strip FFF's
+ * tool from non-target providers. `before_agent_start` fires after every
+ * `session_start` handler, so we only borrow `glob`/`grep` when no other
+ * extension has already provided them.
  *
  * The OpenCode version is read from a locally installed OpenCode binary when
  * one is available (so this keeps working as OpenCode ships new releases). It
@@ -320,7 +329,12 @@ export default function opencodeClientSpoof(pi: ExtensionAPI) {
 	// expose real `glob`/`grep` aliases when the session lacks those names.
 	// Both are invisible in the system prompt (no snippet) and only advertised
 	// for free-tier opencode requests.
-	pi.on("session_start", () => {
+	//
+	// Runs on `before_agent_start`, not `session_start`, so other extensions'
+	// `session_start` handlers have already registered their tools (see the
+	// file header). It fires again on later turns; the `active` check makes it a
+	// no-op once the aliases exist.
+	pi.on("before_agent_start", () => {
 		const active = new Set(pi.getActiveTools());
 		const additions: string[] = [];
 
