@@ -46,6 +46,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `fullscreen-mode` | Enforces fullscreen TUI + `dark-white-footer` theme |
 | `model-hotkeys` | Alt+1…4 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json` |
 | `muse-spark-reasoning-fix` | Drops encrypted-reasoning replay for Muse Spark on OpenCode gateways |
+| `opencode-client-spoof` | Makes OpenCode Zen free-tier models accept Pi: spoofs `User-Agent`/session id and adds the `glob`/`grep` tool names Zen's client gate requires |
 | `opencode-login` | Unified `/opencode` entry: saves one API key to Zen + Go (mirrored), `copy`/`status`, clipboard copy |
 
 ## 📦 Bundled extensions

@@ -16,7 +16,7 @@
  *   426 {"type":"UpgradeRequired",
  *        "message":"OpenCode 1.17.0 or newer is required to use the free tier"}
  *
- * Verified against the live gateway, the gate has two parts:
+ * Verified against the live gateway, the gate has three parts:
  *
  *   1. `User-Agent` must identify OpenCode and claim a supported version.
  *      OpenCode sends `opencode/<version>`
@@ -33,6 +33,18 @@
  *
  *      `x-opencode-client` used to be part of the story for metrics, but the
  *      gate does not care which known OpenCode client value is sent.
+ *
+ *   3. The request *body* must look like an agentic OpenCode turn: it must be
+ *      streaming (`stream: true`) and declare tools named `bash`, `glob`,
+ *      `grep`, and `read`. Verified against the live gateway: removing any one
+ *      of those four names, emptying `tools`, or setting `stream: false` all
+ *      bring the 403 FreeTierError back, while tool descriptions/schemas and
+ *      every other tool name are ignored. OpenCode streams by default and Pi
+ *      always ships `read` and `bash`, but its search tools are `grep`/`find`
+ *      only when those are the active names - FFF-based setups expose
+ *      `ffgrep`/`fffind` instead, so `glob` is always missing and `grep` is
+ *      usually missing too. The request is therefore rejected again even with
+ *      perfect headers.
  *
  * Pi deliberately identifies itself instead:
  *
@@ -64,6 +76,15 @@
  *   User-Agent         -> "opencode/<version>"
  *   x-opencode-session -> a stable, well-formed OpenCode session id
  *
+ * `before_provider_request` then fixes the body-level gate. On session start
+ * it makes sure the request can advertise `glob` and `grep`: `glob` is
+ * registered as a thin alias of Pi's built-in `find`, and the built-in `grep`
+ * is registered under the `grep` name when the session does not already expose
+ * one (FFF, for example, exposes `ffgrep` instead). Only for free-tier
+ * `opencode` requests are those two names left in the outgoing payload's
+ * `tools` array; every other request has the names we added stripped back out,
+ * so no other provider sees a tool Pi would not normally send.
+ *
  * The OpenCode version is read from a locally installed OpenCode binary when
  * one is available (so this keeps working as OpenCode ships new releases). It
  * can be overridden with `PI_OPENCODE_SPOOF_VERSION`, which must itself be
@@ -71,7 +92,11 @@
  */
 import { execFileSync } from "node:child_process";
 import type { Api, Model, ProviderHeaders } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 
 /** Only models on OpenCode's main Zen provider are eligible. */
 const OPENCODE_PROVIDER = "opencode";
@@ -214,7 +239,119 @@ function setHeader(headers: ProviderHeaders, name: string, value: string): void 
 	headers[key ?? name] = value;
 }
 
+/**
+ * Console's free-tier gate requires the body to declare tools named `bash`,
+ * `glob`, `grep`, and `read`. Pi always ships `read` and `bash`; the search
+ * tools are the loose ends: Pi names them `find`/`grep`, and FFF-based setups
+ * expose `ffind`/`ffgrep` instead, so `glob` is always missing and `grep` is
+ * usually missing too.
+ */
+const GLOB_TOOL_NAME = "glob";
+const GREP_TOOL_NAME = "grep";
+
+/** Read a provider-format tool entry's name (Responses / Anthropic / completions). */
+function toolEntryName(entry: unknown): string | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
+	const record = entry as Record<string, unknown>;
+	if (typeof record.name === "string") return record.name;
+	const fn = record.function;
+	if (fn && typeof fn === "object" && typeof (fn as Record<string, unknown>).name === "string") {
+		return (fn as Record<string, unknown>).name as string;
+	}
+	return undefined;
+}
+
+/** Clone a provider-format tool entry under a new name, preserving its shape. */
+function cloneToolEntry(template: unknown, name: string): unknown {
+	if (template && typeof template === "object") {
+		const record = template as Record<string, unknown>;
+		const fn = record.function;
+		if (fn && typeof fn === "object") {
+			return { ...record, function: { ...(fn as Record<string, unknown>), name } };
+		}
+		return { ...record, name };
+	}
+	return {
+		type: "function",
+		name,
+		description: "Search files by pattern.",
+		parameters: {
+			type: "object",
+			properties: { pattern: { type: "string", description: "Glob or search pattern" } },
+			required: ["pattern"],
+		},
+	};
+}
+
+/** Existing entries that can stand in for the `glob` / `grep` names we add. */
+const GLOB_TEMPLATES = ["find", "ffind", GLOB_TOOL_NAME];
+const GREP_TEMPLATES = [GREP_TOOL_NAME, "ffgrep"];
+
+/** Make sure the payload's `tools` array carries both gated search tools. */
+function ensureGateTools(payload: Record<string, unknown>): void {
+	if (!Array.isArray(payload.tools)) return;
+	const tools = payload.tools as unknown[];
+	const present = new Set(tools.map(toolEntryName).filter((name): name is string => !!name));
+	for (const [name, templates] of [
+		[GLOB_TOOL_NAME, GLOB_TEMPLATES],
+		[GREP_TOOL_NAME, GREP_TEMPLATES],
+	] as const) {
+		if (present.has(name)) continue;
+		const template = tools.find((entry) => templates.includes(toolEntryName(entry) ?? ""));
+		tools.push(cloneToolEntry(template, name));
+	}
+}
+
+/** Strip a tool name out of the payload, keeping non-target providers untouched. */
+function removeTool(payload: Record<string, unknown>, name: string): void {
+	if (!Array.isArray(payload.tools)) return;
+	const tools = payload.tools as unknown[];
+	const filtered = tools.filter((entry) => toolEntryName(entry) !== name);
+	if (filtered.length !== tools.length) payload.tools = filtered;
+}
+
 export default function opencodeClientSpoof(pi: ExtensionAPI) {
+	// Names this session did not originally have. Only these are stripped back
+	// out of requests that are not free-tier opencode calls.
+	const borrowed = new Set<string>();
+
+	// The Console gate looks for tools literally named `glob` and `grep`. Pi
+	// names those capabilities `find`/`grep` (or `ffind`/`ffgrep` with FFF), so
+	// expose real `glob`/`grep` aliases when the session lacks those names.
+	// Both are invisible in the system prompt (no snippet) and only advertised
+	// for free-tier opencode requests.
+	pi.on("session_start", () => {
+		const active = new Set(pi.getActiveTools());
+		const additions: string[] = [];
+
+		if (!active.has(GLOB_TOOL_NAME)) {
+			pi.registerTool({
+				...createFindToolDefinition(process.cwd()),
+				name: GLOB_TOOL_NAME,
+				label: GLOB_TOOL_NAME,
+				promptSnippet: undefined,
+				promptGuidelines: undefined,
+			});
+			additions.push(GLOB_TOOL_NAME);
+		}
+
+		if (!active.has(GREP_TOOL_NAME)) {
+			pi.registerTool({
+				...createGrepToolDefinition(process.cwd()),
+				name: GREP_TOOL_NAME,
+				label: GREP_TOOL_NAME,
+				promptSnippet: undefined,
+				promptGuidelines: undefined,
+			});
+			additions.push(GREP_TOOL_NAME);
+		}
+
+		if (additions.length > 0) {
+			pi.setActiveTools([...active, ...additions]);
+			for (const name of additions) borrowed.add(name);
+		}
+	});
+
 	pi.on("before_provider_headers", (event, ctx) => {
 		const headers = event.headers;
 		if (!headers) return;
@@ -235,5 +372,24 @@ export default function opencodeClientSpoof(pi: ExtensionAPI) {
 			piSessionId = undefined;
 		}
 		setHeader(headers, "x-opencode-session", opencodeSessionId(piSessionId));
+	});
+
+	// Body-level gate: free-tier requests must declare `glob` and `grep`. The
+	// proxy sees provider-format tools here (before_provider_request runs after
+	// Pi converts them), so this works for Responses, Chat Completions and
+	// Anthropic Messages alike.
+	pi.on("before_provider_request", (event, ctx) => {
+		const payload = event.payload;
+		if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
+		const record = payload as Record<string, unknown>;
+		const model = ctx.model as Model<Api> | undefined;
+
+		if (isFreeOpencodeModel(model)) {
+			ensureGateTools(record);
+			return;
+		}
+		// Unknown model: leave the payload alone rather than guess. Known
+		// non-target models never see the borrowed tools.
+		if (model) for (const name of borrowed) removeTool(record, name);
 	});
 }
