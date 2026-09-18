@@ -7,12 +7,17 @@
  * so fresh installs lose our choices.
  *
  * On `session_start` this backfills preferred defaults for keys that are ABSENT
- * (never overwriting explicit choices) and enforces ENFORCED_DEFAULTS even when
- * present with a different value. Delete a key from a table to stop managing it.
+ * (never overwriting explicit choices) and enforces ENFORCED_DEFAULTS in the
+ * GLOBAL file. Enforcement is not absolute: blackhole merges a project-local
+ * `<cwd>/.pi/pi-blackhole-config.json` over the global file and applies
+ * `PI_BLACKHOLE_*` env vars last, so either can shadow an enforced value. When
+ * that happens we warn instead of fighting the override. Delete a key from a
+ * table to stop managing it.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { RETAINED_TOOL_OUTPUT_MAX_TOKENS } from "./shared/compaction.ts";
 
 /** Preferred defaults. Only applied when the key is missing from the global file. */
 const PREFERRED_DEFAULTS: Record<string, unknown> = {
@@ -24,7 +29,9 @@ const PREFERRED_DEFAULTS: Record<string, unknown> = {
 };
 
 /**
- * Enforced values. Applied even when the key exists with a different value.
+ * Enforced values, written to the GLOBAL file even when the key exists with a
+ * different value. A project-local config or `PI_BLACKHOLE_*` env var takes
+ * precedence at blackhole's runtime and shadows these (see `detectShadows`).
  *
  * Background observer/reflector/dropper workers share the session model's rate
  * limit when no dedicated worker models are configured, producing
@@ -35,7 +42,7 @@ const PREFERRED_DEFAULTS: Record<string, unknown> = {
  */
 const ENFORCED_DEFAULTS: Record<string, unknown> = {
 	memory: false,
-	// Hard general limit (299k). An explicit `compactAfterTokens` always wins
+	// Global backstop (299k). An explicit `compactAfterTokens` always wins
 	// over `compactAfterRatio` / the preset curve, so pinning it here disables
 	// the built-in `default` preset for windows above ~299k. compact-per-model
 	// sets the operative policy *below* this (249k default, luna 245k), so
@@ -46,14 +53,86 @@ const ENFORCED_DEFAULTS: Record<string, unknown> = {
 	// Retain more recent tool output (20k default) in the post-compaction
 	// context. Enforced so the value tracks the plugin on every machine instead
 	// of freezing at whatever a config file first wrote (0 = budget disabled).
-	// 24900 = 10% of the 249k per-model compaction threshold.
-	retainedToolOutputMaxTokens: 24_900,
+	// Derived from the shared per-model threshold (10%), currently 24900.
+	retainedToolOutputMaxTokens: RETAINED_TOOL_OUTPUT_MAX_TOKENS,
+};
+
+/**
+ * Env vars that shadow `ENFORCED_DEFAULTS` at blackhole's runtime, with the same
+ * parsing blackhole uses (see pi-blackhole `src/core/config-env.ts`). Invalid
+ * values are ignored by blackhole, so they are ignored here too.
+ */
+const ENFORCED_ENV_VARS: Record<
+	string,
+	{ var: string; parse: (raw: string) => unknown }
+> = {
+	memory: {
+		var: "PI_BLACKHOLE_MEMORY",
+		parse: (raw) => {
+			const v = raw.trim().toLowerCase();
+			if (["1", "true", "yes", "on"].includes(v)) return true;
+			if (["0", "false", "no", "off"].includes(v)) return false;
+			return undefined;
+		},
+	},
+	compactAfterTokens: {
+		var: "PI_BLACKHOLE_COMPACT_AFTER_TOKENS",
+		parse: (raw) => {
+			const n = Number(raw);
+			return Number.isInteger(n) && n > 0 ? n : undefined;
+		},
+	},
+	retainedToolOutputMaxTokens: {
+		var: "PI_BLACKHOLE_RETAINED_TOOL_OUTPUT_MAX_TOKENS",
+		parse: (raw) => {
+			const n = Number.parseInt(raw, 10);
+			return Number.isFinite(n) && n > 0 ? n : undefined;
+		},
+	},
 };
 
 function blackholeConfigPath(): string {
 	const override = process.env.PI_CODING_AGENT_DIR?.trim();
 	const agentDir = override || getAgentDir();
 	return join(agentDir, "pi-blackhole", "pi-blackhole-config.json");
+}
+
+/** Read a JSON object from disk, or null when missing / malformed / not an object. */
+function readJsonObject(path: string): Record<string, unknown> | null {
+	try {
+		if (!existsSync(path)) return null;
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+		return parsed as Record<string, unknown>;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Return descriptions of enforced keys that a higher-precedence source
+ * (project-local config or `PI_BLACKHOLE_*` env var) will override at runtime.
+ * Only differences are reported, so re-asserting an enforced value stays quiet.
+ */
+function detectShadows(cwd: string): string[] {
+	const shadows: string[] = [];
+	const project = readJsonObject(join(cwd, ".pi", "pi-blackhole-config.json"));
+	if (project) {
+		for (const [key, value] of Object.entries(ENFORCED_DEFAULTS)) {
+			if (key in project && project[key] !== value) {
+				shadows.push(`${key}=${JSON.stringify(project[key])} (project config)`);
+			}
+		}
+	}
+	for (const [key, spec] of Object.entries(ENFORCED_ENV_VARS)) {
+		const raw = process.env[spec.var];
+		if (raw === undefined) continue;
+		const parsed = spec.parse(raw);
+		if (parsed !== undefined && parsed !== ENFORCED_DEFAULTS[key]) {
+			shadows.push(`${key}=${JSON.stringify(parsed)} (${spec.var})`);
+		}
+	}
+	return shadows;
 }
 
 function applyDefaults(): { backfilled: string[]; enforced: string[] } {
@@ -114,6 +193,19 @@ export default function blackholeDefaults(pi: ExtensionAPI) {
 				`blackhole-defaults: set ${applied.backfilled.join(", ")} in pi-blackhole-config.json (was absent)`,
 				"info",
 			);
+		}
+
+		// Enforcement only covers the global file; blackhole lets project config and
+		// env vars win. Surface that instead of pretending the value always holds.
+		try {
+			for (const shadow of detectShadows(ctx.cwd)) {
+				ctx.ui.notify(
+					`blackhole-defaults: ${shadow} shadows an enforced global value — pi-blackhole will use that instead`,
+					"warning",
+				);
+			}
+		} catch {
+			// Never let shadow detection break startup.
 		}
 	});
 }
