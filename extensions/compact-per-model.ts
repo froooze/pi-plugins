@@ -12,13 +12,14 @@
  *   blackhole's `session_before_compact` pipeline — blackhole keeps owning
  *   the *engine* (deterministic summary), this extension owns the *timing*.
  *
- * The global standard is 299k: blackhole enforces `compactAfterTokens:
- * 299000` (see `blackhole-defaults.ts`) and this extension carries 299k
- * for 1M-window models, 90% of window for luna (245k). Equal thresholds on
- * 1M models mean both triggers evaluate the same boundary — whichever
- * `agent_end` handler runs first fires, the other no-ops. Luna (245k) always
- * fires before blackhole (299k). Blackhole remains the fallback safety net
- * and still owns the *engine* (deterministic summary) for every compaction.
+ * 299k is blackhole's hard general limit (enforced in `blackhole-defaults.ts`);
+ * this extension sets the operative policy *below* it: 249k for the listed
+ * 1M-window models and as the fallback default, 245k for luna (90% of its
+ * 272k window). Every per-model value is strictly under the 299k backstop, so
+ * per-model timing always wins and blackhole only fires as the safety net
+ * (disabled / cooldown / stale-ctx cases) — the two triggers no longer race on
+ * the same boundary. Blackhole still owns the *engine* (deterministic summary)
+ * for every compaction.
  *
  * Config lives in `<agentDir>/compact-per-model.json`. Only values that
  * differ from code DEFAULTS are persisted, so future DEFAULTS changes
@@ -26,14 +27,14 @@
  * DEFAULTS:
  * {
  *   "enabled": true,
- *   "default": 299000,          // fallback for unlisted models
+ *   "default": 249000,          // fallback for unlisted models
  *   "midRun": false,            // also check on turn_end (aborts the run!)
  *   "cooldownMs": 30000,
  *   "notify": true,
  *   "models": {
- *     "opencode/muse-spark-1.3-contributor-free": 299000,
+ *     "opencode/muse-spark-1.3-contributor-free": 249000,
  *     "openai-codex/gpt-5.6-luna": 245000,
- *     "opencode-go/*": 299000
+ *     "opencode-go/*": 249000
  *   }
  * }
  *
@@ -61,25 +62,23 @@ type Config = {
 
 const DEFAULTS: Config = {
 	enabled: true,
-	default: 299_000,
+	default: 249_000,
 	midRun: false,
 	cooldownMs: 30_000,
 	notify: true,
 	removedModels: [],
-	// 1M-window models mirror the 299k global standard enforced in
-	// `blackhole-defaults.ts` (tie → first `agent_end` handler wins, the
-	// other no-ops); luna undercuts at 90% of its window so per-model timing
-	// wins there. Note: openai-codex/gpt-5.6-luna has a 272k window
-	// (short-context pricing tier); 90% of 272k = 244.8k, rounded to 245k.
-	// Kept at a round 90% so the boundary is a policy, not a cliff-edge.
+	// 249k is the operative per-model policy, strictly below blackhole's 299k
+	// hard limit (`blackhole-defaults.ts`) so per-model timing always wins and
+	// blackhole stays a pure fallback. luna undercuts at 90% of its 272k window
+	// (short-context pricing tier); 90% of 272k = 244.8k → 245k.
 	models: {
-		"opencode/muse-spark-1.3-contributor-free": 299_000,
-		"opencode/muse-spark-1.3": 299_000,
-		"opencode/muse-spark-1.2-contributor-free": 299_000,
-		"opencode/muse-spark-1.2": 299_000,
-		"opencode-go/glm-5.3-flash": 299_000,
-		"opencode/glm-5.3-flash": 299_000,
-		"opencode-go/deepseek-v4.1-flash": 299_000,
+		"opencode/muse-spark-1.3-contributor-free": 249_000,
+		"opencode/muse-spark-1.3": 249_000,
+		"opencode/muse-spark-1.2-contributor-free": 249_000,
+		"opencode/muse-spark-1.2": 249_000,
+		"opencode-go/glm-5.3-flash": 249_000,
+		"opencode/glm-5.3-flash": 249_000,
+		"opencode-go/deepseek-v4.1-flash": 249_000,
 		"openai-codex/gpt-5.6-luna": 245_000,
 		"opencode/gpt-5.6-luna": 245_000,
 		"opencode-go/gpt-5.6-luna": 245_000,
