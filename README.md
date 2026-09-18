@@ -45,6 +45,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `fff-guard` | Confines FFF indexing to the project cwd (never `/`/`$HOME`); fail-fast with rg/fd fallback hints |
 | `fullscreen-mode` | Enforces fullscreen TUI + `dark-white-footer` theme |
 | `model-hotkeys` | Alt+1…4 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json` |
+| `local-history` | Per-turn file `/undo`/`/redo` + `/local-history` status via sidecar before-images next to the session file (no git, no tokens, `edit`/`write` only) |
 | `muse-spark-reasoning-fix` | Drops encrypted-reasoning replay for Muse Spark on OpenCode gateways |
 | `opencode-client-spoof` | Makes OpenCode Zen free-tier models accept Pi: spoofs `User-Agent`/session id and adds the `glob`/`grep` tool names Zen's client gate requires |
 | `opencode-login` | Unified `/opencode` entry: saves one API key to Zen + Go (mirrored), `copy`/`status`, clipboard copy |
@@ -57,7 +58,6 @@ The extensions below ship as pinned npm `dependencies` (auto-resolved on `npm in
 |-----------|---------|--------------|
 | [`@ff-labs/pi-fff`](https://github.com/froooze/fff/tree/pi-fff-only) (fork split of [`dmtrKovalenko/fff`](https://github.com/dmtrKovalenko/fff/tree/main/packages/pi-fff)) | `froooze/fff#18ac372` | FFF-powered fuzzy file/content search; overrides built-in `find`/`grep`, `@`-mention autocomplete, `--fff-*` CLI flags |
 | [`@juicesharp/rpiv-todo`](https://github.com/froooze/rpiv-mono/tree/rpiv-todo-only) (fork split of [`juicesharp/rpiv-mono`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo)) | `froooze/rpiv-mono#1b176e4` | `todo` tool + `/todos` command with a live overlay that survives `/reload` and compaction |
-| [`@baylarsadigov/omp-undo-redo`](https://github.com/froooze/omp-undo-redo) (fork of [`Baylar55/omp-undo-redo`](https://github.com/Baylar55/omp-undo-redo)) | `froooze/omp-undo-redo#2a23eb5` | Session + file `/undo`/`/redo` via Git snapshots (works in non-Git workspaces via private per-workspace repo) |
 | [`pi-blackhole`](https://github.com/froooze/pi-blackhole) (fork of [`k0valik/pi-blackhole`](https://github.com/k0valik/pi-blackhole)) | `froooze/pi-blackhole#fb712c8` | Deterministic `/blackhole` compaction + observational memory (`/blackhole-memory`, `/blackhole-recall`, `recall` tool); replaces LLM `/compact` |
 | [`pi-subagents-lite`](https://github.com/froooze/pi-subagents-lite) (fork of [`AlexParamonov/pi-subagents-lite`](https://github.com/AlexParamonov/pi-subagents-lite)) | `froooze/pi-subagents-lite#1faf13e` | Lightweight sub-agents (`Agent`/`StopAgent`/`AgentStatus` tools, `/agents` menu, foreground + background with steering/continuation, worktree support, live widget); schema-first, minimal token overhead |
 
