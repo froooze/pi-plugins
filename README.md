@@ -59,7 +59,6 @@ The extensions below ship as pinned npm `dependencies` (auto-resolved on `npm in
 | [`@ff-labs/pi-fff`](https://github.com/froooze/fff/tree/pi-fff-only) (fork split of [`dmtrKovalenko/fff`](https://github.com/dmtrKovalenko/fff/tree/main/packages/pi-fff)) | `froooze/fff#18ac372` | FFF-powered fuzzy file/content search; overrides built-in `find`/`grep`, `@`-mention autocomplete, `--fff-*` CLI flags |
 | [`@juicesharp/rpiv-todo`](https://github.com/froooze/rpiv-mono/tree/rpiv-todo-only) (fork split of [`juicesharp/rpiv-mono`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-todo)) | `froooze/rpiv-mono#1b176e4` | `todo` tool + `/todos` command with a live overlay that survives `/reload` and compaction |
 | [`pi-blackhole`](https://github.com/froooze/pi-blackhole) (fork of [`k0valik/pi-blackhole`](https://github.com/k0valik/pi-blackhole)) | `froooze/pi-blackhole#fb712c8` | Deterministic `/blackhole` compaction + observational memory (`/blackhole-memory`, `/blackhole-recall`, `recall` tool); replaces LLM `/compact` |
-| [`pi-subagents-lite`](https://github.com/froooze/pi-subagents-lite) (fork of [`AlexParamonov/pi-subagents-lite`](https://github.com/AlexParamonov/pi-subagents-lite)) | `froooze/pi-subagents-lite#1faf13e` | Lightweight sub-agents (`Agent`/`StopAgent`/`AgentStatus` tools, `/agents` menu, foreground + background with steering/continuation, worktree support, live widget); schema-first, minimal token overhead |
 
 To load only a subset, filter in `~/.pi/agent/settings.json`:
 
