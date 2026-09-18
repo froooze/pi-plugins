@@ -14,11 +14,11 @@
  *
  * The global standard is 299k: blackhole enforces `compactAfterTokens:
  * 299000` (see `blackhole-defaults.ts`) and this extension carries 299k
- * for 1M-window models, 255k for luna. Equal thresholds on 1M models mean
- * both triggers evaluate the same boundary — whichever `agent_end` handler
- * runs first fires, the other no-ops. Luna (255k) always fires before
- * blackhole (299k). Blackhole remains the fallback safety net and still
- * owns the *engine* (deterministic summary) for every compaction.
+ * for 1M-window models, 90% of window for luna (245k). Equal thresholds on
+ * 1M models mean both triggers evaluate the same boundary — whichever
+ * `agent_end` handler runs first fires, the other no-ops. Luna (245k) always
+ * fires before blackhole (299k). Blackhole remains the fallback safety net
+ * and still owns the *engine* (deterministic summary) for every compaction.
  *
  * Config lives in `<agentDir>/compact-per-model.json`. Only values that
  * differ from code DEFAULTS are persisted, so future DEFAULTS changes
@@ -32,7 +32,7 @@
  *   "notify": true,
  *   "models": {
  *     "opencode/muse-spark-1.3-contributor-free": 299000,
- *     "openai-codex/gpt-5.6-luna": 255000,
+ *     "openai-codex/gpt-5.6-luna": 245000,
  *     "opencode-go/*": 299000
  *   }
  * }
@@ -68,9 +68,10 @@ const DEFAULTS: Config = {
 	removedModels: [],
 	// 1M-window models mirror the 299k global standard enforced in
 	// `blackhole-defaults.ts` (tie → first `agent_end` handler wins, the
-	// other no-ops); luna undercuts at 255k so per-model timing wins there.
-	// Note: openai-codex/gpt-5.6-luna has a 272k window (short-context
-	// pricing tier), so 255k is ~94% — very late by design.
+	// other no-ops); luna undercuts at 90% of its window so per-model timing
+	// wins there. Note: openai-codex/gpt-5.6-luna has a 272k window
+	// (short-context pricing tier); 90% of 272k = 244.8k, rounded to 245k.
+	// Kept at a round 90% so the boundary is a policy, not a cliff-edge.
 	models: {
 		"opencode/muse-spark-1.3-contributor-free": 299_000,
 		"opencode/muse-spark-1.3": 299_000,
@@ -79,9 +80,9 @@ const DEFAULTS: Config = {
 		"opencode-go/glm-5.3-flash": 299_000,
 		"opencode/glm-5.3-flash": 299_000,
 		"opencode-go/deepseek-v4.1-flash": 299_000,
-		"openai-codex/gpt-5.6-luna": 255_000,
-		"opencode/gpt-5.6-luna": 255_000,
-		"opencode-go/gpt-5.6-luna": 255_000,
+		"openai-codex/gpt-5.6-luna": 245_000,
+		"opencode/gpt-5.6-luna": 245_000,
+		"opencode-go/gpt-5.6-luna": 245_000,
 	},
 };
 
