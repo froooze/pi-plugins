@@ -49,6 +49,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `muse-spark-reasoning-fix` | Drops encrypted-reasoning replay for Muse Spark on OpenCode gateways |
 | `opencode-client-spoof` | Makes OpenCode Zen free-tier models accept Pi: spoofs `User-Agent`/session id and adds the `glob`/`grep` tool names Zen's client gate requires |
 | `opencode-login` | Unified `/opencode` entry: saves one API key to Zen + Go (mirrored), `copy`/`status`, clipboard copy |
+| `pi-upgrade` | `/pi-upgrade [--check\|--offline\|--force]` syncs and rebuilds the local `froooze/pi` source checkout (fetch-and-count, fail-open dep install, post-build staleness guard) |
 
 ## 📦 Bundled extensions
 
