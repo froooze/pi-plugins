@@ -22,11 +22,14 @@
 export const COMPACT_PER_MODEL_1M = 295_000;
 
 /**
- * Auto-compact threshold (tokens) for `gpt-5.6-luna`: 90% of its 272k
- * short-context pricing-tier window (90% of 272k = 244.8k → 245k). The
- * short-context tier drives billing, so this must not be raised casually.
+ * Auto-compact threshold (tokens) for `gpt-5.6-luna`: ~85% of its 272k
+ * short-context pricing-tier window (85% of 272k = 231.2k → 230k). Lowered
+ * from 90% (245k) to widen headroom to the tier boundary: with the
+ * `agent_end`-only trigger, a long tool loop can overshoot 272k before the
+ * threshold is evaluated. The short-context tier drives billing, so this must
+ * not be raised back toward 272k casually.
  */
-export const COMPACT_PER_MODEL_LUNA = 245_000;
+export const COMPACT_PER_MODEL_LUNA = 230_000;
 
 /**
  * Fallback auto-compact threshold (tokens) for models not listed in
@@ -57,3 +60,17 @@ export const RETAINED_TOOL_OUTPUT_RATIO = 0.1;
 export const RETAINED_TOOL_OUTPUT_MAX_TOKENS = Math.round(
 	COMPACT_PER_MODEL_1M * RETAINED_TOOL_OUTPUT_RATIO,
 );
+
+/**
+ * Pi's recent-context retention after a compaction cut
+ * (`compaction.keepRecentTokens` in Pi's global `settings.json`). Blackhole runs
+ * with `tailBehavior: "pi-default"`, so it honours Pi's cut and this is the
+ * verbatim tail that survives each compaction. Sized at roughly double
+ * `RETAINED_TOOL_OUTPUT_MAX_TOKENS` so the kept tail is about half tool output
+ * and half conversation; on a 1M-window model a 60k tail is ~6%.
+ *
+ * `blackhole-defaults.ts` mirrors this into `settings.json`. Pi reads settings
+ * once at startup, so the write takes effect after `/reload` or a restart.
+ * `test/compaction.test.ts` enforces that it exceeds the tool-output budget.
+ */
+export const KEEP_RECENT_TOKENS = 60_000;

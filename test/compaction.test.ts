@@ -17,6 +17,7 @@ import {
 	COMPACT_PER_MODEL_1M,
 	COMPACT_PER_MODEL_DEFAULT,
 	COMPACT_PER_MODEL_LUNA,
+	KEEP_RECENT_TOKENS,
 	RETAINED_TOOL_OUTPUT_MAX_TOKENS,
 	RETAINED_TOOL_OUTPUT_RATIO,
 } from "../extensions/shared/compaction.ts";
@@ -33,5 +34,15 @@ test("retained tool-output budget is derived from the 1M threshold", () => {
 	assert.equal(
 		RETAINED_TOOL_OUTPUT_MAX_TOKENS,
 		Math.round(COMPACT_PER_MODEL_1M * RETAINED_TOOL_OUTPUT_RATIO),
+	);
+});
+
+test("the Pi kept tail is larger than the retained tool-output budget", () => {
+	// Blackhole runs `tailBehavior: pi-default`, so `keepRecentTokens` is the
+	// verbatim tail. It must exceed the tool-output sub-budget for that budget to
+	// bind inside the tail (otherwise it is silently inert).
+	assert.ok(
+		KEEP_RECENT_TOKENS > RETAINED_TOOL_OUTPUT_MAX_TOKENS,
+		`keepRecentTokens ${KEEP_RECENT_TOKENS} must exceed the tool-output budget ${RETAINED_TOOL_OUTPUT_MAX_TOKENS}`,
 	);
 });

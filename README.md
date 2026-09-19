@@ -39,9 +39,9 @@ pi install git:github.com/froooze/pi-plugins@v1
 
 | Extension | What it does |
 |-----------|--------------|
-| `blackhole-defaults` | Backfills preferred and enforces fixed pi-blackhole settings in the global config (blackhole engine; 299k backstop, 24.9k retained tool output, memory off); warns when project config/env shadows them |
+| `blackhole-defaults` | Backfills preferred and enforces fixed pi-blackhole settings in the global config (blackhole engine, `tailBehavior: pi-default`, 300k backstop, 29.5k retained tool output, 60k Pi `keepRecentTokens`, memory off); warns when project config/env/model overrides shadow them |
 | `colored-footer` | Per-stat colored footer; extension statuses (e.g. 🗜) render inline |
-| `compact-per-model` | Per-model auto-compact thresholds (249k, luna 90% ≈ 245k) below blackhole's 299k backstop on settled runs; blackhole stays the engine |
+| `compact-per-model` | Per-model auto-compact thresholds (249k, luna 85% ≈ 230k) below blackhole's 300k backstop on settled runs; blackhole stays the engine |
 | `fff-guard` | Confines FFF indexing to the project cwd (never `/`/`$HOME`); fail-fast with rg/fd fallback hints |
 | `fullscreen-mode` | Enforces fullscreen TUI + `dark-white-footer` theme |
 | `model-hotkeys` | Alt+1…4 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json` |

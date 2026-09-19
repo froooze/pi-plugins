@@ -16,8 +16,8 @@
  * `blackhole-defaults.ts`; a project-local config or `PI_BLACKHOLE_*` env var
  * can shadow it). This extension sets the operative policy *below* it: 295k
  * for the listed 1M-window models (muse-spark, glm, deepseek V4), 249k as the
- * fallback default for unlisted models, 245k for luna
- * (90% of its 272k window). Every per-model value is strictly under the 300k
+ * fallback default for unlisted models, 230k for luna
+ * (~85% of its 272k window). Every per-model value is strictly under the 300k
  * backstop, so per-model timing always wins and blackhole only fires as the
  * safety net (disabled / cooldown / stale-ctx cases) — the two triggers no
  * longer race on the same boundary. Blackhole still owns the *engine*
@@ -35,7 +35,7 @@
  *   "notify": true,
  *   "models": {
  *     "opencode/muse-spark-1.3-contributor-free": 295000,
- *     "openai-codex/gpt-5.6-luna": 245000,
+ *     "openai-codex/gpt-5.6-luna": 230000,
  *     "opencode-go/deepseek-v4.1-flash": 295000
  *   }
  * }
@@ -73,8 +73,8 @@ const DEFAULTS: Config = {
 	// 295k is the operative policy for the listed 1M-window models, strictly
 	// below blackhole's 300k global backstop (`blackhole-defaults.ts`) so
 	// per-model timing always wins and blackhole stays a pure fallback. luna
-	// undercuts at 90% of its 272k window (short-context pricing tier); 90% of
-	// 272k = 244.8k → 245k. The 249k fallback (`default`) still applies to any
+	// undercuts at ~85% of its 272k window (short-context pricing tier); 85% of
+	// 272k = 231.2k → 230k. The 249k fallback (`default`) still applies to any
 	// unlisted model.
 	models: {
 		"opencode/muse-spark-1.3-contributor-free": COMPACT_PER_MODEL_1M,

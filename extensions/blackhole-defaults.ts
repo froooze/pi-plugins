@@ -13,11 +13,22 @@
  * `PI_BLACKHOLE_*` env vars last, so either can shadow an enforced value. When
  * that happens we warn instead of fighting the override. Delete a key from a
  * table to stop managing it.
+ *
+ * It also mirrors Pi's own cut size into `<agentDir>/settings.json`: blackhole
+ * runs with `tailBehavior: "pi-default"` and therefore honours Pi's
+ * `compaction.keepRecentTokens` instead of its own aggressive "minimal" cut.
+ * Pi caches settings in memory at startup, so that write takes effect after
+ * `/reload` or a restart, and a project `settings.json` or a per-model
+ * `compaction.modelOverrides` entry can still shadow it (we warn).
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { COMPACT_BACKSTOP_TOKENS, RETAINED_TOOL_OUTPUT_MAX_TOKENS } from "./shared/compaction.ts";
+import {
+	COMPACT_BACKSTOP_TOKENS,
+	KEEP_RECENT_TOKENS,
+	RETAINED_TOOL_OUTPUT_MAX_TOKENS,
+} from "./shared/compaction.ts";
 
 /** Preferred defaults. Only applied when the key is missing from the global file. */
 const PREFERRED_DEFAULTS: Record<string, unknown> = {
@@ -46,7 +57,7 @@ const ENFORCED_DEFAULTS: Record<string, unknown> = {
 	// over `compactAfterRatio` / the preset curve, so pinning it here disables
 	// the built-in `default` preset for windows above ~300k. compact-per-model
 	// sets the operative policy *below* this (295k listed 1M-window models, 249k
-	// fallback default, luna 245k), so per-model timing fires first and this stays
+	// fallback default, luna 230k), so per-model timing fires first and this stays
 	// a pure safety net (also covering disabled / cooldown / stale-ctx cases). Blackhole still owns
 	// the *engine* (deterministic summary) for every compaction.
 	compactAfterTokens: COMPACT_BACKSTOP_TOKENS,
@@ -55,6 +66,12 @@ const ENFORCED_DEFAULTS: Record<string, unknown> = {
 	// of freezing at whatever a config file first wrote (0 = budget disabled).
 	// Derived from the shared 1M-window threshold (10%), currently 29500.
 	retainedToolOutputMaxTokens: RETAINED_TOOL_OUTPUT_MAX_TOKENS,
+	// Blackhole honours Pi's cut (rather than its aggressive default "minimal"),
+	// pairing the deterministic summary with a verbatim recent tail. The tail
+	// size itself is Pi's `compaction.keepRecentTokens`, mirrored into Pi's
+	// settings.json below (see `applyPiSettings`). Enforced because blackhole
+	// defaults to "minimal" and its settings modal can flip it back.
+	tailBehavior: "pi-default",
 };
 
 /**
@@ -95,6 +112,13 @@ function blackholeConfigPath(): string {
 	const override = process.env.PI_CODING_AGENT_DIR?.trim();
 	const agentDir = override || getAgentDir();
 	return join(agentDir, "pi-blackhole", "pi-blackhole-config.json");
+}
+
+/** Pi's global settings file (`<agentDir>/settings.json`). */
+function piSettingsPath(): string {
+	const override = process.env.PI_CODING_AGENT_DIR?.trim();
+	const agentDir = override || getAgentDir();
+	return join(agentDir, "settings.json");
 }
 
 /** Read a JSON object from disk, or null when missing / malformed / not an object. */
@@ -174,6 +198,82 @@ function applyDefaults(): { backfilled: string[]; enforced: string[] } {
 	return { backfilled, enforced };
 }
 
+/**
+ * Backfill/enforce Pi's `compaction.keepRecentTokens` — the cut size blackhole's
+ * `pi-default` tail honours. Every other key (including other `compaction`
+ * fields such as `reserveTokens`) is preserved, so a project `settings.json` or
+ * a per-model `compaction.modelOverrides` entry can still shadow it at Pi's
+ * runtime.
+ *
+ * Pi loads settings once at startup and serves them from memory, so the change
+ * is visible to the *next* session (`/reload` or restart), not the current one.
+ * Pi's own saves patch only the fields it modified, so this key survives them.
+ */
+function applyPiSettings(): { changed: boolean; previous: string | null; skipped: boolean } {
+	const path = piSettingsPath();
+	let settings: Record<string, unknown>;
+	if (existsSync(path)) {
+		const parsed = readJsonObject(path);
+		if (parsed === null) return { changed: false, previous: null, skipped: true }; // Corrupt: leave it for Pi.
+		settings = parsed;
+	} else {
+		settings = {};
+	}
+
+	const compaction =
+		settings.compaction && typeof settings.compaction === "object" && !Array.isArray(settings.compaction)
+			? { ...(settings.compaction as Record<string, unknown>) }
+			: {};
+	const existing = compaction.keepRecentTokens;
+	if (existing === KEEP_RECENT_TOKENS) return { changed: false, previous: null, skipped: false };
+
+	compaction.keepRecentTokens = KEEP_RECENT_TOKENS;
+	settings.compaction = compaction;
+	mkdirSync(join(path, ".."), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`);
+	return {
+		changed: true,
+		previous: existing === undefined ? null : JSON.stringify(existing),
+		skipped: false,
+	};
+}
+
+/**
+ * Report Pi-side sources that shadow the enforced global `keepRecentTokens`:
+ * a project-local `<cwd>/.pi/settings.json`, or a per-model
+ * `compaction.modelOverrides[...]` entry in the global file. Both win over the
+ * global value in Pi's resolver, so we surface rather than fight them.
+ */
+function detectPiShadows(cwd: string): string[] {
+	const shadows: string[] = [];
+
+	const projectCompaction = readJsonObject(join(cwd, ".pi", "settings.json"))?.compaction;
+	if (
+		projectCompaction !== null &&
+		typeof projectCompaction === "object" &&
+		!Array.isArray(projectCompaction)
+	) {
+		const value = (projectCompaction as Record<string, unknown>).keepRecentTokens;
+		if (value !== undefined && value !== KEEP_RECENT_TOKENS) {
+			shadows.push(`keepRecentTokens=${JSON.stringify(value)} (.pi/settings.json)`);
+		}
+	}
+
+	const overrides = (readJsonObject(piSettingsPath())?.compaction as Record<string, unknown> | undefined)
+		?.modelOverrides;
+	if (overrides !== null && typeof overrides === "object" && !Array.isArray(overrides)) {
+		for (const [model, entry] of Object.entries(overrides as Record<string, unknown>)) {
+			if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+			const value = (entry as Record<string, unknown>).keepRecentTokens;
+			if (value !== undefined && value !== KEEP_RECENT_TOKENS) {
+				shadows.push(`keepRecentTokens=${JSON.stringify(value)} (modelOverrides["${model}"])`);
+			}
+		}
+	}
+
+	return shadows;
+}
+
 export default function blackholeDefaults(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		let applied: { backfilled: string[]; enforced: string[] };
@@ -195,12 +295,40 @@ export default function blackholeDefaults(pi: ExtensionAPI) {
 			);
 		}
 
+		// The `pi-default` tail size lives in Pi's own settings, which Pi caches
+		// at startup — write it now; it applies on /reload or restart.
+		try {
+			const piSettings = applyPiSettings();
+			if (piSettings.changed) {
+				ctx.ui.notify(
+					piSettings.previous === null
+						? `blackhole-defaults: set compaction.keepRecentTokens=${KEEP_RECENT_TOKENS} in settings.json (was absent) — applies after /reload`
+						: `blackhole-defaults: enforced compaction.keepRecentTokens=${KEEP_RECENT_TOKENS} in settings.json (was ${piSettings.previous}) — applies after /reload`,
+					"info",
+				);
+			}
+		} catch {
+			// Never let Pi-settings enforcement break startup.
+		}
+
 		// Enforcement only covers the global file; blackhole lets project config and
 		// env vars win. Surface that instead of pretending the value always holds.
 		try {
 			for (const shadow of detectShadows(ctx.cwd)) {
 				ctx.ui.notify(
 					`blackhole-defaults: ${shadow} shadows an enforced global value — pi-blackhole will use that instead`,
+					"warning",
+				);
+			}
+		} catch {
+			// Never let shadow detection break startup.
+		}
+
+		// Pi-side shadows of the enforced cut size (project settings / per-model overrides).
+		try {
+			for (const shadow of detectPiShadows(ctx.cwd)) {
+				ctx.ui.notify(
+					`blackhole-defaults: ${shadow} shadows the enforced keepRecentTokens — Pi will use that instead`,
 					"warning",
 				);
 			}
