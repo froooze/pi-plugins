@@ -47,9 +47,10 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `model-hotkeys` | Alt+1…4 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json` |
 | `local-history` | Per-turn file `/undo`/`/redo` + `/local-history` status via sidecar before-images next to the session file (no git, no tokens, `edit`/`write` only) |
 | `muse-spark-reasoning-fix` | Drops encrypted-reasoning replay for Muse Spark on OpenCode gateways |
-| `opencode-client-spoof` | Makes OpenCode Zen free-tier models accept Pi: spoofs `User-Agent`/session id and adds the `glob`/`grep` tool names Zen's client gate requires |
+| `opencode-client-spoof` | Makes OpenCode Zen free-tier models accept Pi: spoofs `User-Agent`/session id and adds minimal `glob`/`grep` gate tools (gate checks names only, so no duplicated schemas) |
 | `opencode-login` | Unified `/opencode` entry: saves one API key to Zen + Go (mirrored), `copy`/`status`, clipboard copy |
 | `pi-upgrade` | `/pi-upgrade [--check\|--offline\|--force]` syncs and rebuilds the local `froooze/pi` source checkout (fetch-and-count, fail-open dep install, post-build staleness guard) |
+| `prompt-slim` | Trims per-request system-prompt overhead: compacts pi's `<docs>` section and drops bundled tools' `promptGuidelines` bullets that merely restate their description/schema; `/prompt-slim` status, `PI_PROMPT_SLIM=off\|docs\|guidelines` |
 
 ## 📦 Bundled extensions
 

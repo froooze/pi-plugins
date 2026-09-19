@@ -78,9 +78,10 @@
  *
  * `before_provider_request` then fixes the body-level gate. Before the agent
  * starts it makes sure the request can advertise `glob` and `grep`: `glob` is
- * registered as a thin alias of Pi's built-in `find`, and the built-in `grep`
- * is registered under the `grep` name when the session does not already expose
- * one (FFF, for example, exposes `ffgrep` instead). Only for free-tier
+ * registered as a thin alias of Pi's built-in `find` (with a minimal schema,
+ * since the gate ignores schemas), and the built-in `grep` is registered under
+ * the `grep` name when the session does not already expose one (FFF, for
+ * example, exposes `ffgrep` instead). Only for free-tier
  * `opencode` requests are those two names left in the outgoing payload's
  * `tools` array; every other request has the names we added stripped back out,
  * so no other provider sees a tool Pi would not normally send.
@@ -106,6 +107,7 @@ import {
 	createGrepToolDefinition,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 /** Only models on OpenCode's main Zen provider are eligible. */
 const OPENCODE_PROVIDER = "opencode";
@@ -258,6 +260,20 @@ function setHeader(headers: ProviderHeaders, name: string, value: string): void 
 const GLOB_TOOL_NAME = "glob";
 const GREP_TOOL_NAME = "grep";
 
+/**
+ * Minimal schema for the borrowed gate tools. Zen's free-tier gate only checks
+ * the tool *names* (`bash`, `glob`, `grep`, `read`) - descriptions and schemas
+ * are ignored. The session's real search tools (`fffind`/`ffgrep`, or
+ * `find`/`grep`) already carry their full schemas, so these aliases ship a
+ * tiny schema instead of duplicating the built-in definition and inflating
+ * every free-tier request.
+ */
+const GATE_TOOL_SCHEMA = Type.Object({
+	pattern: Type.String({ description: "Glob (glob) or regex/literal (grep) pattern" }),
+	path: Type.Optional(Type.String({ description: "Directory or file (default: cwd)" })),
+	limit: Type.Optional(Type.Number({ description: "Max results" })),
+});
+
 /** Read a provider-format tool entry's name (Responses / Anthropic / completions). */
 function toolEntryName(entry: unknown): string | undefined {
 	if (!entry || typeof entry !== "object") return undefined;
@@ -343,8 +359,10 @@ export default function opencodeClientSpoof(pi: ExtensionAPI) {
 				...createFindToolDefinition(process.cwd()),
 				name: GLOB_TOOL_NAME,
 				label: GLOB_TOOL_NAME,
+				description: "Find files by glob pattern.",
 				promptSnippet: undefined,
 				promptGuidelines: undefined,
+				parameters: GATE_TOOL_SCHEMA,
 			});
 			additions.push(GLOB_TOOL_NAME);
 		}
@@ -354,8 +372,10 @@ export default function opencodeClientSpoof(pi: ExtensionAPI) {
 				...createGrepToolDefinition(process.cwd()),
 				name: GREP_TOOL_NAME,
 				label: GREP_TOOL_NAME,
+				description: "Search file contents by pattern.",
 				promptSnippet: undefined,
 				promptGuidelines: undefined,
+				parameters: GATE_TOOL_SCHEMA,
 			});
 			additions.push(GREP_TOOL_NAME);
 		}
