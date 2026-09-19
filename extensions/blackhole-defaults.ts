@@ -17,7 +17,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { RETAINED_TOOL_OUTPUT_MAX_TOKENS } from "./shared/compaction.ts";
+import { COMPACT_BACKSTOP_TOKENS, RETAINED_TOOL_OUTPUT_MAX_TOKENS } from "./shared/compaction.ts";
 
 /** Preferred defaults. Only applied when the key is missing from the global file. */
 const PREFERRED_DEFAULTS: Record<string, unknown> = {
@@ -42,18 +42,18 @@ const PREFERRED_DEFAULTS: Record<string, unknown> = {
  */
 const ENFORCED_DEFAULTS: Record<string, unknown> = {
 	memory: false,
-	// Global backstop (299k). An explicit `compactAfterTokens` always wins
+	// Global backstop (300k). An explicit `compactAfterTokens` always wins
 	// over `compactAfterRatio` / the preset curve, so pinning it here disables
-	// the built-in `default` preset for windows above ~299k. compact-per-model
-	// sets the operative policy *below* this (249k default, luna 245k), so
-	// per-model timing fires first and this stays a pure safety net (also
-	// covering disabled / cooldown / stale-ctx cases). Blackhole still owns the
-	// *engine* (deterministic summary) for every compaction.
-	compactAfterTokens: 299_000,
+	// the built-in `default` preset for windows above ~300k. compact-per-model
+	// sets the operative policy *below* this (295k listed 1M-window models, 249k
+	// fallback default, luna 245k), so per-model timing fires first and this stays
+	// a pure safety net (also covering disabled / cooldown / stale-ctx cases). Blackhole still owns
+	// the *engine* (deterministic summary) for every compaction.
+	compactAfterTokens: COMPACT_BACKSTOP_TOKENS,
 	// Retain more recent tool output (20k default) in the post-compaction
 	// context. Enforced so the value tracks the plugin on every machine instead
 	// of freezing at whatever a config file first wrote (0 = budget disabled).
-	// Derived from the shared per-model threshold (10%), currently 24900.
+	// Derived from the shared 1M-window threshold (10%), currently 29500.
 	retainedToolOutputMaxTokens: RETAINED_TOOL_OUTPUT_MAX_TOKENS,
 };
 
