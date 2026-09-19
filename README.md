@@ -52,6 +52,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `opencode-session-id` | Fills Pi's session id into extension-initiated one-shot completions so OpenCode/Go get the `x-opencode-session` routing header (fixes `/btw`'s `400 MissingSessionID`); `PI_OPENCODE_ZEN_SPOOF=1` opt-in also spoofs free-tier Zen (UA + `ses_…` id + gate tools with `toolChoice:none`) |
 | `pi-upgrade` | `/pi-upgrade [--check\|--offline\|--force]` syncs and rebuilds the local `froooze/pi` source checkout (fetch-and-count, fail-open dep install, post-build staleness guard) |
 | `prompt-slim` | Trims per-request system-prompt overhead: compacts pi's `<docs>` section and drops bundled tools' `promptGuidelines` bullets that merely restate their description/schema; `/prompt-slim` status, `PI_PROMPT_SLIM=off\|docs\|guidelines` |
+| `todo-reconcile` | On `agent_settled`, if the `rpiv-todo` list still has open tasks, injects one follow-up telling the model to finish or reconcile them. TUI-only; aborts, exhausted errors, deferred ops, and headless/subagent/RPC sessions are skipped, one nudge per user turn (`<agentDir>/todo-reconcile.json`) |
 
 ## 📦 Bundled extensions
 
