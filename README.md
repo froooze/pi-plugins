@@ -45,6 +45,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `fff-guard` | Confines FFF indexing to the project cwd (never `/`/`$HOME`); fail-fast with rg/fd fallback hints |
 | `fullscreen-mode` | Enforces fullscreen TUI + `dark-white-footer` theme |
 | `model-hotkeys` | Alt+1…4 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json` |
+| `model-defaults` | Applies the repo-versioned startup model/thinking default from `model-defaults.json` on fresh sessions; `settings.json` is only written to drop redundant/stale mirrors, and an explicit local value always wins (`/model-defaults`) |
 | `local-history` | Per-turn file `/undo`/`/redo` + `/local-history` status via sidecar before-images next to the session file (no git, no tokens, `edit`/`write` only) |
 | `muse-spark-reasoning-fix` | Drops encrypted-reasoning replay for Muse Spark on OpenCode gateways |
 | `opencode-client-spoof` | Makes OpenCode Zen free-tier models accept Pi: spoofs `User-Agent`/session id and adds minimal `glob`/`grep` gate tools (gate checks names only, so no duplicated schemas) |
@@ -53,6 +54,25 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `pi-upgrade` | `/pi-upgrade [--check\|--offline\|--force]` syncs and rebuilds the local `froooze/pi` source checkout (fetch-and-count, fail-open dep install, post-build staleness guard); checkout located via `PI_UPGRADE_REPO`, `<agentDir>/pi-upgrade.json`, or auto-derived from the running pi (no baked-in path) |
 | `prompt-slim` | Trims per-request system-prompt overhead: compacts pi's `<docs>` section and drops bundled tools' `promptGuidelines` bullets that merely restate their description/schema; `/prompt-slim` status, `PI_PROMPT_SLIM=off\|docs\|guidelines` |
 | `todo-reconcile` | On `agent_settled`, if the `rpiv-todo` list still has open tasks, injects one follow-up telling the model to finish or reconcile them. TUI-only; aborts, exhausted errors, deferred ops, and headless/subagent/RPC sessions are skipped, one nudge per user turn (`<agentDir>/todo-reconcile.json`) |
+
+## 🧭 Model defaults
+
+The startup model/thinking default is centralized in `model-defaults.json`, so it reaches every machine through the git package instead of living in each `~/.pi/agent/settings.json`:
+
+```json
+{
+  "defaultProvider": "opencode-go",
+  "defaultModel": "deepseek-v4.1-flash",
+  "defaultThinkingLevel": "low"
+}
+```
+
+`model-defaults` applies it on a fresh session and never seeds it into `settings.json`. Precedence:
+
+- an explicit local value (e.g. saved with `/model` → Ctrl+S) **always wins**;
+- a local value equal to the shared one is removed as redundant;
+- a local value equal to the previously propagated shared value (tracked in `<agentDir>/model-defaults.state.json`) is removed as stale, so a centralized update takes effect;
+- `--model` / `--provider` / `--thinking` win for that run.
 
 ## 📦 Bundled extensions
 
