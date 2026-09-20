@@ -14,39 +14,92 @@
  * - `GODEBUG=containermaxprocs=0` for tsgo, whose Go runtime mis-detects CPUs
  *   on hosts with a malformed /sys/fs/cgroup/cpu.max.
  *
- * Configuration (all optional environment variables):
- *   PI_UPGRADE_REPO             checkout to sync (default ~/BTS/Git/pi)
+ * Checkout resolution (most specific first):
+ *   1. `PI_UPGRADE_REPO` environment variable
+ *   2. `<agentDir>/pi-upgrade.json`  { "repo": "/abs/path/to/pi" }
+ *   3. derived from the running pi install
+ *      (`<root>/packages/coding-agent` -> `<root>`; no machine-specific path)
+ *
+ * Other configuration (environment variables):
  *   PI_UPGRADE_REMOTE           git remote   (default origin)
  *   PI_UPGRADE_BRANCH           git branch   (default main)
  *   PI_UPGRADE_EXPECTED_REMOTE  substring the remote URL should contain
  *                               (default froooze/pi; mismatch only warns)
  */
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import {
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	getAgentDir,
+	getPackageDir,
+} from "@earendil-works/pi-coding-agent";
 
-const REPO = process.env.PI_UPGRADE_REPO?.trim() || join(homedir(), "BTS", "Git", "pi");
 const REMOTE = process.env.PI_UPGRADE_REMOTE?.trim() || "origin";
 const BRANCH = process.env.PI_UPGRADE_BRANCH?.trim() || "main";
 const EXPECTED_REMOTE = process.env.PI_UPGRADE_EXPECTED_REMOTE?.trim() || "froooze/pi";
-const BUNDLE = join(REPO, "packages", "coding-agent", "dist", "bundle", "cli.js");
+const CONFIG_FILE_NAME = "pi-upgrade.json";
 
-const HELP = [
-	"Usage: /pi-upgrade [--check] [--offline] [--force]",
-	"",
-	"  --check    report whether the fork has new commits, then exit (read-only)",
-	"  --offline  skip the network model-data refresh",
-	"  --force    rebuild even if the checkout is already up to date",
-	"",
-	`Repo:   ${REPO} (${REMOTE}/${BRANCH})`,
-].join("\n");
+function configPath(): string {
+	return join(getAgentDir(), CONFIG_FILE_NAME);
+}
+
+function readConfiguredRepo(): string | undefined {
+	const path = configPath();
+	if (!existsSync(path)) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		const repo = (parsed as { repo?: unknown }).repo;
+		return typeof repo === "string" && repo.trim() ? repo.trim() : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Locate the pi source checkout, most specific first:
+ *   1. `PI_UPGRADE_REPO`
+ *   2. `<agentDir>/pi-upgrade.json` `{ "repo": "/abs/path" }`
+ *   3. derived from the running pi package dir (`<root>/packages/coding-agent` -> `<root>`)
+ *
+ * No machine-specific path is baked in: a from-source (npm-linked) pi is
+ * self-locating, and anything else opts in via env or config.
+ */
+export function resolveRepo(): string | undefined {
+	const fromEnv = process.env.PI_UPGRADE_REPO?.trim();
+	if (fromEnv) return fromEnv;
+
+	const configured = readConfiguredRepo();
+	if (configured) return configured;
+
+	const packageDir = getPackageDir();
+	const root = dirname(dirname(packageDir));
+	if (basename(dirname(packageDir)) === "packages" && existsSync(join(root, ".git"))) {
+		return root;
+	}
+	return undefined;
+}
+
+function helpText(repo: string): string {
+	return [
+		"Usage: /pi-upgrade [--check] [--offline] [--force]",
+		"",
+		"  --check    report whether the fork has new commits, then exit (read-only)",
+		"  --offline  skip the network model-data refresh",
+		"  --force    rebuild even if the checkout is already up to date",
+		"",
+		`Repo:   ${repo} (${REMOTE}/${BRANCH})`,
+	].join("\n");
+}
 
 export interface UpgradeOptions {
 	check?: boolean;
 	offline?: boolean;
 	force?: boolean;
+	/** Checkout to sync; resolved outside the pure upgrade routine. */
+	repo?: string;
 }
 
 export interface UpgradeResult {
@@ -75,7 +128,7 @@ function run(
 ): Promise<RunResult> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(command, args, {
-			cwd: options.cwd ?? REPO,
+			cwd: options.cwd,
 			env: { ...process.env, GODEBUG: withGodebug(process.env.GODEBUG), ...(options.env ?? {}) },
 			signal: options.signal,
 			stdio: ["ignore", "pipe", "pipe"],
@@ -142,13 +195,21 @@ function parseOptions(input: string): UpgradeOptions & { help?: boolean } {
  * git/npm CLIs, so it can be exercised from a plain Node script.
  */
 export async function runPiUpgrade(options: UpgradeOptions, log: Logger = () => {}): Promise<UpgradeResult> {
-	if (!existsSync(join(REPO, ".git"))) {
-		return { ok: false, message: `${REPO} is not a git checkout (no .git found).` };
+	const repo = options.repo?.trim();
+	if (!repo) {
+		return {
+			ok: false,
+			message: `No pi source checkout configured. Set PI_UPGRADE_REPO or write ${configPath()} with {"repo": "/path/to/pi"}.`,
+		};
 	}
+	if (!existsSync(join(repo, ".git"))) {
+		return { ok: false, message: `${repo} is not a git checkout (no .git found).` };
+	}
+	const bundle = join(repo, "packages", "coding-agent", "dist", "bundle", "cli.js");
 
 	// Only stream the long-running steps; git plumbing would flood the widget.
 	const exec = (command: string, args: string[], stream = false): Promise<RunResult> =>
-		run(command, args, stream ? { onLog: log } : {});
+		run(command, args, stream ? { cwd: repo, onLog: log } : { cwd: repo });
 
 	// Discard npm's harmless `"peer": true` lockfile rewrite so it cannot block
 	// the pull. Other local edits are intentionally left alone.
@@ -160,7 +221,7 @@ export async function runPiUpgrade(options: UpgradeOptions, log: Logger = () => 
 
 	const remote = await exec("git", ["remote", "get-url", REMOTE]);
 	if (remote.code !== 0) {
-		return { ok: false, message: `remote '${REMOTE}' is not configured in ${REPO}.` };
+		return { ok: false, message: `remote '${REMOTE}' is not configured in ${repo}.` };
 	}
 	const remoteUrl = remote.stdout.trim();
 	if (!remoteUrl.includes(EXPECTED_REMOTE)) {
@@ -200,7 +261,7 @@ export async function runPiUpgrade(options: UpgradeOptions, log: Logger = () => 
 	}
 
 	const dirty = (await exec("git", ["status", "--porcelain"])).stdout.trim().length > 0;
-	if (incoming === 0 && !options.force && !dirty && existsSync(BUNDLE)) {
+	if (incoming === 0 && !options.force && !dirty && existsSync(bundle)) {
 		const ahead = outgoing > 0 ? ` (${outgoing} local commit(s) ahead)` : "";
 		return { ok: true, message: `pi is already up to date: ${head}${ahead}` };
 	}
@@ -224,7 +285,7 @@ export async function runPiUpgrade(options: UpgradeOptions, log: Logger = () => 
 	// Fail-open dependency check: install when node_modules is missing or
 	// incomplete, when the manifest changed across the pull, or when it is dirty.
 	const depsNeeded = async (): Promise<boolean> => {
-		if (!existsSync(join(REPO, "node_modules", ".package-lock.json"))) return true;
+		if (!existsSync(join(repo, "node_modules", ".package-lock.json"))) return true;
 		const changed = await exec("git", ["diff", "--name-only", before, "HEAD", "--", "package.json", "package-lock.json"]);
 		if (changed.code !== 0 || changed.stdout.trim()) return true;
 		const manifestDirty = await exec("git", ["status", "--porcelain", "--", "package.json", "package-lock.json"]);
@@ -258,15 +319,15 @@ export async function runPiUpgrade(options: UpgradeOptions, log: Logger = () => 
 	}
 
 	// Post-build guard: the artifact must exist, have been refreshed, and run.
-	if (!existsSync(BUNDLE)) {
-		return { ok: false, message: `build did not produce ${BUNDLE}.` };
+	if (!existsSync(bundle)) {
+		return { ok: false, message: `build did not produce ${bundle}.` };
 	}
-	if (statSync(BUNDLE).mtimeMs < buildStart - 2000) {
-		return { ok: false, message: `${BUNDLE} was not refreshed by the build (tsgo may have no-op'd).` };
+	if (statSync(bundle).mtimeMs < buildStart - 2000) {
+		return { ok: false, message: `${bundle} was not refreshed by the build (tsgo may have no-op'd).` };
 	}
-	const version = await run(process.execPath, [BUNDLE, "--version"]);
+	const version = await run(process.execPath, [bundle, "--version"], { cwd: repo });
 	if (version.code !== 0) {
-		return { ok: false, message: `${BUNDLE} exists but does not run.` };
+		return { ok: false, message: `${bundle} exists but does not run.` };
 	}
 
 	const newHead = (await exec("git", ["log", "--oneline", "-1"])).stdout.trim();
@@ -289,8 +350,21 @@ export default function piUpgrade(pi: ExtensionAPI): void {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 				return;
 			}
+
 			if (options.help) {
-				ctx.ui.notify(HELP, "info");
+				ctx.ui.notify(helpText(resolveRepo() ?? `<unresolved: set PI_UPGRADE_REPO or ${configPath()}>`), "info");
+				return;
+			}
+
+			const repo = resolveRepo();
+			if (!repo) {
+				ctx.ui.notify(
+					[
+						"No pi source checkout found.",
+						`Set PI_UPGRADE_REPO, or create ${configPath()} with {"repo": "/path/to/pi"}.`,
+					].join("\n"),
+					"error",
+				);
 				return;
 			}
 
@@ -305,7 +379,7 @@ export default function piUpgrade(pi: ExtensionAPI): void {
 			if (ctx.hasUI) ctx.ui.setStatus("pi-upgrade", "running");
 			let result: UpgradeResult;
 			try {
-				result = await runPiUpgrade(options, log);
+				result = await runPiUpgrade({ ...options, repo }, log);
 			} catch (error) {
 				result = { ok: false, message: error instanceof Error ? error.message : String(error) };
 			} finally {
