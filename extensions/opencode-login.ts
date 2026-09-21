@@ -68,6 +68,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { copyToClipboard, getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import {
 	createOpencodeOAuth,
+	loadConsoleProjection,
 	OPENCODE_GO_PROVIDER,
 	type OpenCodeCredential,
 } from "./shared/opencode-oauth.ts";
@@ -202,6 +203,53 @@ function siblingOAuthReader(provider: string): () => OpenCodeCredential | undefi
 			expires: record.expires,
 		} as OpenCodeCredential;
 	};
+}
+
+/**
+ * Backfill a pre-migration OAuth credential's console projection (inference
+ * endpoint + per-model wire API) from `${console}/api/config`, so an account
+ * logged in before per-model routing was captured (or before a server-side
+ * change) picks up Responses-only models without a re-login. Returns true when
+ * auth.json changed.
+ *
+ * Best-effort and startup-only: runs once per process, skips API-key setups and
+ * `--offline`, and leaves auth.json untouched when the fetch fails.
+ */
+async function backfillConsoleProjection(): Promise<boolean> {
+	if (process.env.PI_OFFLINE) return false;
+	const path = authPath();
+	const needsBackfill = PROVIDERS.some((provider) => {
+		const credential = readStoredCredential(provider, path);
+		if (!isOAuthCredential(credential)) return false;
+		const block = (credential as Record<string, unknown>).console;
+		return !(
+			block &&
+			typeof block === "object" &&
+			(block as Record<string, unknown>).modelRoutes
+		);
+	});
+	if (!needsBackfill) return false;
+
+	const source = siblingOAuthReader(ZEN)() ?? siblingOAuthReader(GO)();
+	if (!source) return false;
+	const projection = await loadConsoleProjection(source, { signal: AbortSignal.timeout(5000) });
+	if (!projection) return false;
+
+	const data = loadAuthFile(path);
+	let changed = false;
+	for (const provider of PROVIDERS) {
+		const current = data[provider];
+		if (!isOAuthCredential(current)) continue;
+		data[provider] = { ...(current as Record<string, unknown>), console: projection };
+		changed = true;
+	}
+	if (!changed) return false;
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, {
+		encoding: "utf-8",
+		mode: 0o600,
+	});
+	return true;
 }
 
 function statusLine(ctx: ExtensionCommandContext): string {
@@ -549,16 +597,24 @@ export default function opencodeLogin(pi: ExtensionAPI) {
 			} catch {
 				// Status nudge only; never break startup.
 			}
-			return;
+		} else {
+			ctx.ui.notify(
+				`opencode-login: mirrored the OpenCode credential so both ${ZEN} and ${GO} show as configured.`,
+				"info",
+			);
 		}
+
+		let projectionUpdated = false;
+		try {
+			projectionUpdated = await backfillConsoleProjection();
+		} catch {
+			// Backfill is best effort; a failed fetch leaves auth.json unchanged.
+		}
+		if (!mirrored && !projectionUpdated) return;
 		try {
 			await ctx.modelRegistry.refresh({ allowNetwork: false, providers: [...PROVIDERS] });
 		} catch {
 			// File is fixed; the next availability pass converges.
 		}
-		ctx.ui.notify(
-			`opencode-login: mirrored the OpenCode credential so both ${ZEN} and ${GO} show as configured.`,
-			"info",
-		);
 	});
 }

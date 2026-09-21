@@ -25,6 +25,7 @@ import {
 	OPENCODE_OAUTH_CLIENT_ID,
 	OPENCODE_ORG_HEADER,
 	type OpenCodeCredential,
+	apiFromProviderNpm,
 	attemptFromResponse,
 	createOpencodeOAuth,
 	normalizeConsoleUrl,
@@ -349,6 +350,89 @@ test("parseConsoleProjection reads api, org header, and whitelist", () => {
 	});
 	assert.equal(parseConsoleProjection({}), undefined);
 	assert.equal(parseConsoleProjection({ config: { provider: { opencode: { name: "x" } } } }), undefined);
+});
+
+test("apiFromProviderNpm maps OpenCode SDK packages to Pi APIs", () => {
+	assert.equal(apiFromProviderNpm("@ai-sdk/openai"), "openai-responses");
+	assert.equal(apiFromProviderNpm("@ai-sdk/azure"), "openai-responses");
+	assert.equal(apiFromProviderNpm("@ai-sdk/openai-compatible"), "openai-completions");
+	assert.equal(apiFromProviderNpm("@ai-sdk/anthropic"), "anthropic-messages");
+	assert.equal(apiFromProviderNpm("@ai-sdk/google"), "google-generative-ai");
+	assert.equal(apiFromProviderNpm("@openrouter/ai-sdk-provider"), undefined);
+	assert.equal(apiFromProviderNpm(undefined), undefined);
+});
+
+test("parseConsoleProjection captures per-model provider routing", () => {
+	const projection = parseConsoleProjection({
+		config: {
+			provider: {
+				opencode: {
+					api: OPENCODE_INFERENCE_BASE_URL,
+					npm: "@ai-sdk/openai-compatible",
+					options: { headers: { [OPENCODE_ORG_HEADER]: "org-b" } },
+					whitelist: ["mimo-v2.5-free", "muse-spark-1.3-contributor-free", "claude-fable-5"],
+					models: {
+						"mimo-v2.5-free": { name: "MiMo" },
+						"muse-spark-1.3-contributor-free": { provider: { npm: "@ai-sdk/openai" } },
+						"claude-fable-5": {
+							provider: { npm: "@ai-sdk/anthropic", api: "https://opencode.ai/inference/anthropic/v1" },
+						},
+					},
+				},
+			},
+		},
+	});
+	assert.deepEqual(projection?.modelRoutes, {
+		"muse-spark-1.3-contributor-free": { api: "openai-responses" },
+		"claude-fable-5": {
+			api: "anthropic-messages",
+			apiUrl: "https://opencode.ai/inference/anthropic/v1",
+		},
+	});
+	assert.equal(projection?.api, undefined, "openai-compatible is the implicit default");
+});
+
+test("projectConsoleModels routes openai() models to the Responses API", () => {
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: Date.now() + 1000,
+		console: {
+			apiUrl: OPENCODE_INFERENCE_BASE_URL,
+			headers: { [OPENCODE_ORG_HEADER]: "org-1" },
+			models: ["mimo-v2.5-free", "muse-spark-1.3-contributor-free"],
+			modelRoutes: { "muse-spark-1.3-contributor-free": { api: "openai-responses" } },
+		},
+	};
+	const projected = projectConsoleModels(
+		[model("mimo-v2.5-free"), model("muse-spark-1.3-contributor-free")],
+		credential,
+	);
+	const [mimo, muse] = projected;
+	assert.equal(mimo!.api, "openai-completions");
+	assert.equal(mimo!.baseUrl, OPENCODE_INFERENCE_BASE_URL);
+	assert.equal(muse!.api, "openai-responses");
+	assert.equal(muse!.baseUrl, OPENCODE_INFERENCE_BASE_URL);
+	assert.equal(muse!.headers?.[OPENCODE_ORG_HEADER], "org-1");
+});
+
+test("projectConsoleModels uses a per-model apiUrl override", () => {
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: Date.now() + 1000,
+		console: {
+			apiUrl: OPENCODE_INFERENCE_BASE_URL,
+			headers: {},
+			models: ["claude-fable-5"],
+			modelRoutes: {
+				"claude-fable-5": { api: "anthropic-messages", apiUrl: "https://opencode.ai/inference/anthropic/v1" },
+			},
+		},
+	};
+	const projected = projectConsoleModels([model("claude-fable-5")], credential);
+	assert.equal(projected[0]!.api, "anthropic-messages");
+	assert.equal(projected[0]!.baseUrl, "https://opencode.ai/inference/anthropic/v1");
 });
 
 test("parseConsoleProjection falls back to the first provider with an api", () => {

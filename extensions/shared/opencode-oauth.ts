@@ -97,6 +97,14 @@ export interface OpenCodeToken {
 	expiresInSeconds: number;
 }
 
+/** Per-model routing captured from `provider.<id>.models.<model>.provider`. */
+export interface OpenCodeConsoleModelRoute {
+	/** Pi API for the remote `provider.npm` (see {@link apiFromProviderNpm}). */
+	api?: Api;
+	/** Remote `provider.api` when the model overrides the provider endpoint. */
+	apiUrl?: string;
+}
+
 /**
  * Console inference routing captured from `${console}/api/config` at login.
  * OpenCode stores the access token in `OPENCODE_CONSOLE_TOKEN` and merges the
@@ -110,6 +118,10 @@ export interface OpenCodeConsoleProjection {
 	headers: Record<string, string>;
 	/** Remote `provider.<id>.whitelist`; empty means "do not filter". */
 	models: string[];
+	/** Pi API for the provider's top-level `npm`; omitted for chat completions. */
+	api?: Api;
+	/** Per-model `provider.npm`/`provider.api` overrides, keyed by model id. */
+	modelRoutes?: Record<string, OpenCodeConsoleModelRoute>;
 }
 
 export interface OpenCodeCredential {
@@ -443,12 +455,55 @@ function stringRecord(value: unknown): Record<string, string> {
 }
 
 /**
+ * Map an OpenCode provider `npm` package to the Pi API that speaks the same
+ * wire protocol. OpenCode routes each model through the SDK named by its
+ * `provider.npm` (see `packages/opencode/src/session/llm/native-request.ts`):
+ * `@ai-sdk/openai` uses the Responses API, `@ai-sdk/openai-compatible` uses
+ * chat completions, `@ai-sdk/anthropic` uses Messages, and `@ai-sdk/google`
+ * uses generateContent. Unknown packages return `undefined` so callers keep
+ * their default.
+ */
+export function apiFromProviderNpm(npm: string | undefined): Api | undefined {
+	switch (npm) {
+		case "@ai-sdk/openai":
+		case "@ai-sdk/azure":
+			return "openai-responses";
+		case "@ai-sdk/openai-compatible":
+			return "openai-completions";
+		case "@ai-sdk/anthropic":
+			return "anthropic-messages";
+		case "@ai-sdk/google":
+			return "google-generative-ai";
+		default:
+			return undefined;
+	}
+}
+
+/** Read per-model `provider.npm`/`provider.api` overrides from an `entry.models` map. */
+function parseModelRoutes(value: unknown): Record<string, OpenCodeConsoleModelRoute> {
+	const models = recordOrUndefined(value);
+	if (!models) return {};
+	const routes: Record<string, OpenCodeConsoleModelRoute> = {};
+	for (const [id, model] of Object.entries(models)) {
+		const provider = recordOrUndefined(recordOrUndefined(model)?.provider);
+		if (!provider) continue;
+		const api = apiFromProviderNpm(typeof provider.npm === "string" ? provider.npm : undefined);
+		const apiUrl = typeof provider.api === "string" && provider.api.length > 0 ? provider.api : undefined;
+		if (!api && !apiUrl) continue;
+		routes[id] = { ...(api ? { api } : {}), ...(apiUrl ? { apiUrl } : {}) };
+	}
+	return routes;
+}
+
+/**
  * Parse `${console}/api/config` into the account's inference projection.
  *
  * The account config manages exactly one provider (`opencode`), whose `api` is
  * the inference base, `options.headers` carries `x-opencode-org-id`, and
- * `whitelist` lists the models the account may call. We prefer the canonical
- * `opencode` entry and fall back to the first provider that has an `api`.
+ * `whitelist` lists the models the account may call. Per-model `provider`
+ * blocks decide the wire API (Responses vs chat completions, see
+ * {@link apiFromProviderNpm}). We prefer the canonical `opencode` entry and
+ * fall back to the first provider that has an `api`.
  */
 export function parseConsoleProjection(raw: unknown): OpenCodeConsoleProjection | undefined {
 	const providers = recordOrUndefined(recordOrUndefined(raw)?.config)?.provider;
@@ -464,10 +519,15 @@ export function parseConsoleProjection(raw: unknown): OpenCodeConsoleProjection 
 	const whitelist = Array.isArray(entry.whitelist)
 		? entry.whitelist.filter((id): id is string => typeof id === "string" && id.length > 0)
 		: [];
+	const api = apiFromProviderNpm(typeof entry.npm === "string" ? entry.npm : undefined);
+	const modelRoutes = parseModelRoutes(entry.models);
 	return {
 		apiUrl,
 		headers: stringRecord(recordOrUndefined(entry.options)?.headers),
 		models: whitelist,
+		// `openai-completions` is the implicit default; only record a different one.
+		...(api && api !== "openai-completions" ? { api } : {}),
+		...(Object.keys(modelRoutes).length > 0 ? { modelRoutes } : {}),
 	};
 }
 
@@ -495,6 +555,28 @@ async function fetchConsoleProjection(
 }
 
 /**
+ * Re-read a stored console credential's projection from `${console}/api/config`.
+ *
+ * Credentials logged in before per-model routing was captured (or before the
+ * account moved endpoints) have no `console.modelRoutes`, so their catalog
+ * would be projected as plain chat completions and models that need the
+ * Responses API would fail. Callers use this to backfill the projection in
+ * place, with no re-login. Best-effort: returns `undefined` off-network.
+ */
+export async function loadConsoleProjection(
+	credential: OpenCodeCredential,
+	options: { fetch?: FetchLike; signal?: AbortSignal } = {},
+): Promise<OpenCodeConsoleProjection | undefined> {
+	const rawServer = credential.server;
+	const server = normalizeConsoleUrl(
+		typeof rawServer === "string" && rawServer.length > 0 ? rawServer : OPENCODE_CONSOLE_URL,
+	);
+	const orgID = typeof credential.orgID === "string" && credential.orgID ? credential.orgID : undefined;
+	const signal = options.signal ?? new AbortController().signal;
+	return fetchConsoleProjection(server, credential.access, orgID, options.fetch ?? globalThis.fetch, signal);
+}
+
+/**
  * Project Pi's built-in `opencode`/`opencode-go` catalog onto the console
  * account's inference endpoint.
  *
@@ -502,14 +584,18 @@ async function fetchConsoleProjection(
  * which only accept `oc_sk_…`/`sk-…` API keys; an OAuth access token there
  * returns `401 {"type":"AuthError","message":"Invalid API key."}`. The console
  * account instead calls `provider.api` from `/api/config` (typically
- * `https://opencode.ai/inference/openai/v1`) as an OpenAI-compatible endpoint,
- * with the access token as Bearer and `x-opencode-org-id` selecting the
- * workspace. Models outside the account whitelist are hidden (OpenCode's merged
- * config only contains the entitled models).
+ * `https://opencode.ai/inference/openai/v1`) with the access token as Bearer
+ * and `x-opencode-org-id` selecting the workspace. Each model is routed through
+ * the API OpenCode would use for its `provider.npm` (see
+ * {@link apiFromProviderNpm}): most are OpenAI chat completions, but some
+ * (e.g. `muse-spark`, `provider.npm = "@ai-sdk/openai"`) only answer on the
+ * Responses endpoint. Models outside the account whitelist are hidden
+ * (OpenCode's merged config only contains the entitled models).
  */
 export function projectConsoleModels(models: Model<Api>[], credential: OpenCodeCredential): Model<Api>[] {
 	const projection = credential.console;
 	const apiUrl = projection?.apiUrl ?? OPENCODE_INFERENCE_BASE_URL;
+	const defaultApi: Api = projection?.api ?? "openai-completions";
 	const orgID = typeof credential.orgID === "string" && credential.orgID ? credential.orgID : undefined;
 	const headers: Record<string, string> = { ...projection?.headers };
 	// The remote config already carries the header; derive it from orgID for
@@ -520,12 +606,15 @@ export function projectConsoleModels(models: Model<Api>[], credential: OpenCodeC
 	const allowed = projection?.models && projection.models.length > 0 ? new Set(projection.models) : undefined;
 	return models
 		.filter((model) => !allowed || allowed.has(model.id))
-		.map((model) => ({
-			...model,
-			api: "openai-completions" as Api,
-			baseUrl: apiUrl,
-			headers: { ...(model.headers ?? {}), ...headers },
-		}));
+		.map((model) => {
+			const route = projection?.modelRoutes?.[model.id];
+			return {
+				...model,
+				api: route?.api ?? defaultApi,
+				baseUrl: route?.apiUrl ?? apiUrl,
+				headers: { ...(model.headers ?? {}), ...headers },
+			};
+		});
 }
 
 async function refreshToken(
