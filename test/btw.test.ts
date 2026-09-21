@@ -4,7 +4,7 @@
  * Run: node --experimental-strip-types --no-warnings --test test/btw.test.ts
  */
 import { strict as assert } from "node:assert";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -15,6 +15,7 @@ import {
 	findExecutable,
 	launchBtw,
 	normalizeQuestion,
+	resolvePiLaunch,
 	selectLauncher,
 	shellQuote,
 	MSG_NO_TERMINAL,
@@ -59,11 +60,40 @@ test("shellQuote: single-quotes and escapes embedded quotes", () => {
 // buildLauncherScript
 // ---------------------------------------------------------------------------
 
-test("buildLauncherScript: cds, forks, reads the question file, self-cleans", () => {
-	const script = buildLauncherScript({ piBin: "pi", cwd: "/tmp/my project" });
+test("buildLauncherScript: absolute node/entry, PATH, fork, error pause, self-clean", () => {
+	const script = buildLauncherScript({
+		node: "/usr/bin/node",
+		entry: "/opt/pi/cli.js",
+		cwd: "/tmp/my project",
+		path: "/nvm/bin:/usr/bin",
+	});
 	assert.match(script, /cd '\/tmp\/my project' \|\| exit 1/);
-	assert.match(script, /'pi' --fork "\$1" -- "\$\(cat "\$2"\)"/);
+	assert.match(script, /export PATH='\/nvm\/bin:\/usr\/bin':"\$PATH"/);
+	assert.match(script, /'\/usr\/bin\/node' '\/opt\/pi\/cli\.js' --fork "\$1" -- "\$\(cat "\$2"\)"/);
+	assert.match(script, /read -r _ \|\| true/);
 	assert.match(script, /rm -rf -- "\$dir"/);
+});
+
+// ---------------------------------------------------------------------------
+// resolvePiLaunch
+// ---------------------------------------------------------------------------
+
+test("resolvePiLaunch: PI_BTW_PI entry wins; node is this process's executable", () => {
+	const dir = mkdtempSync(join(tmpdir(), "btw-pi-"));
+	try {
+		const entry = join(dir, "cli.js");
+		writeFileSync(entry, "// pi entry\n", "utf8");
+		const pi = resolvePiLaunch({ PI_BTW_PI: entry, PATH: "" });
+		assert.equal(pi?.entry, realpathSync(entry));
+		assert.equal(pi?.node, process.execPath);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("resolvePiLaunch: falls back to this process's own entry", () => {
+	const pi = resolvePiLaunch({ PATH: "" });
+	assert.equal(pi?.entry, realpathSync(process.argv[1]!));
 });
 
 // ---------------------------------------------------------------------------
@@ -108,6 +138,20 @@ test("selectLauncher: tmux beats terminal candidates only inside tmux", () => {
 	const has = (bin: string) => bin === "tmux" || bin === "xfce4-terminal";
 	assert.equal(selectLauncher({ TMUX: "/tmp/tmux-1000/default,1,0" }, has)?.id, "tmux");
 	assert.equal(selectLauncher({}, has)?.id, "xfce4-terminal");
+});
+
+test("selectLauncher: xfce4-terminal disables its server and passes argv verbatim", () => {
+	const launcher = selectLauncher({}, (bin) => bin === "xfce4-terminal");
+	assert.ok(launcher);
+	const args = launcher.build({
+		script: "/s.sh",
+		session: "/s.jsonl",
+		question: "/q.txt",
+		cwd: "/proj",
+		title: "btw: hi",
+	}).args;
+	assert.ok(args.includes("--disable-server"));
+	assert.deepEqual(args.slice(-3), ["/s.sh", "/s.jsonl", "/q.txt"]);
 });
 
 test("selectLauncher: detects is done by the has() predicate", () => {
