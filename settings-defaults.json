@@ -1,0 +1,36 @@
+{
+  "targets": {
+    "settings": {
+      "backfill": {
+        "retry.maxRetries": 6
+      },
+      "enforce": {
+        "compaction.keepRecentTokens": 60000,
+        "tuiMode": "fullscreen",
+        "theme": "dark-white-footer"
+      }
+    },
+    "pi-blackhole": {
+      "backfill": {
+        "compaction": "auto",
+        "compactionEngine": "blackhole"
+      },
+      "enforce": {
+        "memory": false,
+        "compactAfterTokens": 300000,
+        "retainedToolOutputMaxTokens": 29500,
+        "tailBehavior": "pi-default"
+      }
+    },
+    "pi-fff": {
+      "backfill": {
+        "enableFsRootScanning": false,
+        "enableHomeDirScanning": false
+      },
+      "env": {
+        "enableFsRootScanning": "FFF_ENABLE_ROOT_SCAN",
+        "enableHomeDirScanning": "FFF_ENABLE_HOME_SCAN"
+      }
+    }
+  }
+}

@@ -8,16 +8,13 @@
  *
  * Root scanning is already off by default in pi-fff; home scanning defaults
  * to ON, so a bare `pi` from `~` (or a `path: /...` / `path: ~/...` tool
- * call) kicks off the heavy index. This extension backfills
- * `<agentDir>/pi-fff.json` (the file pi-fff's `loadConfig()` reads) with
- * our preferred defaults for keys that are ABSENT, never overwriting
- * explicit user choices. Delete a key from PREFERRED_DEFAULTS to stop
- * managing it.
+ * call) kicks off the heavy index. Those defaults live in the `pi-fff`
+ * target of the repo-versioned `settings-defaults.json`, applied by the
+ * `settings-defaults` extension (eagerly at import, before the bundled
+ * pi-fff extension snapshots its file, and re-checked on session_start).
  *
- * Applied eagerly at import (so pi-fff sees it no matter the
- * session_start handler order) and re-checked on every session_start
- * (so fresh machines converge). Also warns when the current cwd itself
- * is `/` or `$HOME`, where FFF tools will now fail fast instead of
+ * This extension keeps only the guard behavior: it warns when the current
+ * cwd itself is `/` or `$HOME`, where FFF tools fail fast instead of
  * indexing — the fix is to `cd` into the project and run pi there.
  *
  * Finally, a `tool_result` hook catches FFF's fail-fast refusal
@@ -26,84 +23,9 @@
  * (or the builtin `grep`/`find` tools when not in FFF override mode),
  * which handle absolute outside-workspace paths without an index.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, parse, resolve } from "node:path";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
-/**
- * Only applied when the key is missing from pi-fff.json, so explicit file
- * choices always win. The env mirror is additionally skipped when the
- * matching env var is already set or the file key exists (env beats file
- * in pi-fff's flag > env > file order).
- *
- * Each default also mirrors to an env var because pi-fff snapshots the
- * config file at extension load but reads env lazily on every
- * session_start — the env mirror makes us independent of extension load
- * order. Re-imports (e.g. `/reload`, which uses `moduleCache: false`)
- * re-read the file, so the mirror is always exactly as fresh as pi-fff's
- * own file snapshot.
- */
-const PREFERRED_DEFAULTS: Record<string, { value: unknown; env: string }> = {
-	// Refuse pickers rooted at `/` (upstream default is already false;
-	// pin it so a future default flip can't re-enable full-root walks).
-	enableFsRootScanning: { value: false, env: "FFF_ENABLE_ROOT_SCAN" },
-	// Refuse pickers rooted at (or above) `$HOME`. This is the flag behind
-	// the "Your cwd (/) is too large ... prevent home dir indexing with
-	// --fff-enable-home-scan=false" warning: with it false there is no
-	// home index at all, so neither the walk nor the warning happens.
-	enableHomeDirScanning: { value: false, env: "FFF_ENABLE_HOME_SCAN" },
-};
-
-const CONFIG_FILE_NAME = "pi-fff.json";
-
-function configPath(): string {
-	const override = process.env.PI_CODING_AGENT_DIR?.trim();
-	const agentDir = override || getAgentDir();
-	return join(agentDir, CONFIG_FILE_NAME);
-}
-
-function applyDefaults(): { backfilled: string[]; mirrored: string[]; path: string } {
-	const path = configPath();
-	let current: Record<string, unknown> = {};
-	if (existsSync(path)) {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(readFileSync(path, "utf8"));
-		} catch {
-			return { backfilled: [], mirrored: [], path }; // Corrupt file: leave it for pi-fff itself to report.
-		}
-		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-			return { backfilled: [], mirrored: [], path };
-		}
-		current = parsed as Record<string, unknown>;
-	}
-
-	const backfilled: string[] = [];
-	const mirrored: string[] = [];
-	for (const [key, entry] of Object.entries(PREFERRED_DEFAULTS)) {
-		// Env mirror: pi-fff reads env lazily on every session_start,
-		// while it snapshots the file once at extension load. Setting env
-		// here makes us independent of extension load order. Never touch
-		// an explicitly set env var, and never mirror when the key is
-		// explicitly set in the file — env beats file in pi-fff's
-		// flag > env > file order, so mirroring would override the
-		// user's file choice.
-		if (!(key in current)) {
-			if (process.env[entry.env] === undefined || process.env[entry.env] === "") {
-				process.env[entry.env] = entry.value ? "1" : "0";
-				mirrored.push(entry.env);
-			}
-			current[key] = entry.value;
-			backfilled.push(key);
-		}
-	}
-	if (backfilled.length === 0) return { backfilled, mirrored, path };
-
-	mkdirSync(join(path, ".."), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(current, null, 2)}\n`);
-	return { backfilled, mirrored, path };
-}
+import { parse, resolve } from "node:path";
+import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 function isFsRoot(dir: string): boolean {
 	const resolved = resolve(dir);
@@ -112,15 +34,6 @@ function isFsRoot(dir: string): boolean {
 
 function isHomeDir(dir: string): boolean {
 	return resolve(dir) === resolve(homedir());
-}
-
-// Eager: pi-fff resolves flag > env > file at session_start, so the file
-// must already contain our defaults before its handler runs, regardless of
-// extension load/handler order.
-try {
-	applyDefaults();
-} catch {
-	// session_start will retry and report; never break startup from here.
 }
 
 // Tool names pi-fff registers per mode (index.ts: FFF_TOOL_NAMES vs
@@ -231,19 +144,6 @@ export default function fffGuard(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		let applied: { backfilled: string[]; mirrored: string[]; path: string };
-		try {
-			applied = applyDefaults();
-		} catch {
-			return;
-		}
-		if (applied.backfilled.length > 0) {
-			ctx.ui.notify(
-				`fff-guard: set ${applied.backfilled.join(", ")} in ${CONFIG_FILE_NAME} (was absent) — FFF will only index the project directory, never / or $HOME`,
-				"info",
-			);
-		}
-
 		// Friendly diagnosis: with scanning disabled, launching pi from `/`
 		// or `~` makes FFF fail fast ("Refusing to index ..."). Tell the
 		// user the actual fix instead of leaving them with a raw init error.

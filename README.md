@@ -39,11 +39,10 @@ pi install git:github.com/froooze/pi-plugins@v1
 
 | Extension | What it does |
 |-----------|--------------|
-| `blackhole-defaults` | Backfills preferred and enforces fixed pi-blackhole settings in the global config (blackhole engine, `tailBehavior: pi-default`, 300k backstop, 29.5k retained tool output, 60k Pi `keepRecentTokens`, memory off); warns when project config/env/model overrides shadow them |
+| `blackhole-defaults` | Warns when a project-local pi-blackhole config, a `PI_BLACKHOLE_*` env var, a project `settings.json`, or a per-model `compaction.modelOverrides` entry shadows a value enforced by `settings-defaults` |
 | `colored-footer` | Per-stat colored footer; extension statuses (e.g. 🗜) render inline |
 | `compact-per-model` | Per-model auto-compact thresholds (249k, luna 85% ≈ 230k) below blackhole's 300k backstop on settled runs; blackhole stays the engine |
-| `fff-guard` | Confines FFF indexing to the project cwd (never `/`/`$HOME`); fail-fast with rg/fd fallback hints |
-| `fullscreen-mode` | Enforces fullscreen TUI + `dark-white-footer` theme |
+| `fff-guard` | Confines FFF indexing to the project cwd (never `/`/`$HOME`; scanning flags declared in `settings-defaults.json`); warns when launched from `/`/`$HOME`, plus fail-fast `rg`/`fd` fallback hints |
 | `model-hotkeys` | Alt+1…4 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json` |
 | `model-defaults` | Applies the repo-versioned startup model/thinking default from `model-defaults.json` on fresh sessions; `settings.json` is only written to drop redundant/stale mirrors, and an explicit local value always wins (`/model-defaults`) |
 | `local-history` | Per-turn file `/undo`/`/redo` + `/local-history` status via sidecar before-images next to the session file (no git, no tokens, `edit`/`write` only) |
@@ -53,6 +52,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `opencode-session-id` | Fills Pi's session id into extension-initiated one-shot completions so OpenCode/Go get the `x-opencode-session` routing header (fixes `/btw`'s `400 MissingSessionID`); `PI_OPENCODE_ZEN_SPOOF=1` opt-in also spoofs Zen with the same full identity headers (UA + `ses_…`/`msg_…` ids + `x-opencode-project`) and the gate tools with `toolChoice:none`, following `opencode-client-spoof`'s `PI_OPENCODE_SPOOF_SCOPE` |
 | `pi-upgrade` | `/pi-upgrade [--check\|--offline\|--force]` syncs and rebuilds the local `froooze/pi` source checkout (fetch-and-count, fail-open dep install, post-build staleness guard); checkout located via `PI_UPGRADE_REPO`, `<agentDir>/pi-upgrade.json`, or auto-derived from the running pi (no baked-in path) |
 | `prompt-slim` | Trims per-request system-prompt overhead: compacts pi's `<docs>` section and drops bundled tools' `promptGuidelines` bullets that merely restate their description/schema; `/prompt-slim` status, `PI_PROMPT_SLIM=off\|docs\|guidelines` |
+| `settings-defaults` | The single applier for every file-backed plugin default. Writes each target in `settings-defaults.json` through one function: Pi `settings.json` (`retry.maxRetries=6` backfill; `compaction.keepRecentTokens=60000`, `tuiMode`, `theme` enforce), `pi-blackhole/pi-blackhole-config.json` (engine/tail/backstop/retained-output/memory), `pi-fff.json` (root/home scanning, env-mirrored). Applies after `/reload`; `/settings-defaults` status |
 | `todo-reconcile` | On `agent_settled`, if the `rpiv-todo` list still has open tasks, injects one follow-up telling the model to finish or reconcile them. TUI-only; aborts, exhausted errors, deferred ops, and headless/subagent/RPC sessions are skipped, one nudge per user turn (`<agentDir>/todo-reconcile.json`) |
 
 ## 🧭 Model defaults
@@ -73,6 +73,49 @@ The startup model/thinking default is centralized in `model-defaults.json`, so i
 - a local value equal to the shared one is removed as redundant;
 - a local value equal to the previously propagated shared value (tracked in `<agentDir>/model-defaults.state.json`) is removed as stale, so a centralized update takes effect;
 - `--model` / `--provider` / `--thinking` win for that run.
+
+## ⚙️ Settings defaults
+
+Every plugin's file-backed defaults are centralized in `settings-defaults.json`, so they reach every machine through the git package and every target is written by the one shared `applySettingsDefaults` function:
+
+```json
+{
+  "targets": {
+    "settings": {
+      "backfill": { "retry.maxRetries": 6 },
+      "enforce": {
+        "compaction.keepRecentTokens": 60000,
+        "tuiMode": "fullscreen",
+        "theme": "dark-white-footer"
+      }
+    },
+    "pi-blackhole": {
+      "backfill": { "compaction": "auto", "compactionEngine": "blackhole" },
+      "enforce": {
+        "memory": false,
+        "compactAfterTokens": 300000,
+        "retainedToolOutputMaxTokens": 29500,
+        "tailBehavior": "pi-default"
+      }
+    },
+    "pi-fff": {
+      "backfill": { "enableFsRootScanning": false, "enableHomeDirScanning": false },
+      "env": {
+        "enableFsRootScanning": "FFF_ENABLE_ROOT_SCAN",
+        "enableHomeDirScanning": "FFF_ENABLE_HOME_SCAN"
+      }
+    }
+  }
+}
+```
+
+`settings-defaults` applies each target at session start (Pi caches `settings.json` at startup, so writes apply after `/reload`):
+
+- `backfill` — written only when the leaf is absent, so an explicit local value always wins;
+- `enforce` — written whenever the leaf differs, for values that must track the plugin;
+- `env` — mirrors a backfilled boolean to an env var (`true`/`false` → `"1"`/`"0"`) only when that var is unset; pi-fff snapshots its config at extension load, so its target is also applied eagerly at import.
+
+Paths are dotted and ids map to fixed files (`settings.json`, `pi-blackhole/pi-blackhole-config.json`, `pi-fff.json`). Missing intermediate objects are created; a malformed local intermediate (e.g. `"retry": "auto"`) is left untouched and reported, never clobbered. `compact-per-model` deliberately keeps its defaults in `shared/compaction.ts` (its file stores only diffs, so seeding it would freeze future default changes); `model-defaults.json` and `model-hotkeys.json` keep their own targeted mechanisms.
 
 ## 📦 Bundled extensions
 
