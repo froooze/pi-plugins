@@ -44,7 +44,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `colored-footer` | Per-stat colored footer; extension statuses (e.g. 🗜) render inline |
 | `compact-per-model` | Per-model auto-compact thresholds from `shared/compaction.ts`: 295k for the listed 1M-window models (muse-spark, glm, deepseek V4), 249k fallback for unlisted models, 230k for luna (~85% of its 272k window) — all below blackhole's 300k backstop on settled runs; blackhole stays the engine |
 | `fff-guard` | Confines FFF indexing to the project cwd (never `/`/`$HOME`; scanning flags declared in `settings-defaults.json`); warns when launched from `/`/`$HOME`, plus fail-fast `rg`/`fd` fallback hints |
-| `model-hotkeys` | Alt+1…4 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json` |
+| `model-hotkeys` | Alt+1…5 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json`, falling back to the bundled copy when no local one exists |
 | `model-defaults` | Applies the repo-versioned startup model/thinking default from `model-defaults.json` on fresh sessions; `settings.json` is only written to drop redundant/stale mirrors, and an explicit local value always wins (`/model-defaults`) |
 | `local-history` | Per-turn file `/undo`/`/redo` + `/local-history` status via sidecar before-images next to the session file (no git, no tokens, `edit`/`write` only) |
 | `muse-spark-reasoning-fix` | Drops encrypted-reasoning replay for Muse Spark on OpenCode gateways |

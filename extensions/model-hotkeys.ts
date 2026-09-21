@@ -2,19 +2,18 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { KeyId } from "@earendil-works/pi-tui";
+import {
+	type ModelBinding,
+	parseModelBindings,
+	resolveHotkeysConfigPath,
+} from "./shared/model-hotkeys.ts";
 
 const userConfigFile = join(process.env.HOME ?? "", ".pi", "agent", "model-hotkeys.json");
 const bundledConfigFile = join(dirname(fileURLToPath(import.meta.url)), "..", "model-hotkeys.json");
-const CONFIG_FILE = existsSync(userConfigFile) ? userConfigFile : bundledConfigFile;
-
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-
-type ModelBinding = {
-	provider: string;
-	model: string;
-	thinking?: ThinkingLevel;
-	label?: string;
-};
+// Prefer the machine-local file, but fall back to the copy that ships with the
+// plugin so the hotkeys work even with no local config.
+const CONFIG_FILE = resolveHotkeysConfigPath(userConfigFile, bundledConfigFile);
 
 function loadBindings(): Record<string, ModelBinding> {
 	if (!existsSync(CONFIG_FILE)) return {};
@@ -26,34 +25,7 @@ function loadBindings(): Record<string, ModelBinding> {
 		throw new Error(`Could not parse ${CONFIG_FILE}: ${error instanceof Error ? error.message : String(error)}`);
 	}
 
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		throw new Error(`${CONFIG_FILE} must contain an object of shortcut bindings`);
-	}
-
-	const bindings: Record<string, ModelBinding> = {};
-	for (const [shortcut, value] of Object.entries(parsed)) {
-		if (!value || typeof value !== "object" || Array.isArray(value)) {
-			throw new Error(`Binding ${shortcut} must be an object`);
-		}
-
-		const binding = value as Record<string, unknown>;
-		if (typeof binding.provider !== "string" || typeof binding.model !== "string") {
-			throw new Error(`Binding ${shortcut} requires string provider and model fields`);
-		}
-		if (binding.thinking !== undefined &&
-			!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(binding.thinking as string)) {
-			throw new Error(`Binding ${shortcut} has an invalid thinking level`);
-		}
-
-		bindings[shortcut] = {
-			provider: binding.provider,
-			model: binding.model,
-			thinking: binding.thinking as ThinkingLevel | undefined,
-			label: typeof binding.label === "string" ? binding.label : undefined,
-		};
-	}
-
-	return bindings;
+	return parseModelBindings(parsed, CONFIG_FILE);
 }
 
 async function activateBinding(
@@ -89,7 +61,7 @@ export default function modelHotkeys(pi: ExtensionAPI): void {
 	}
 
 	for (const [shortcut, binding] of Object.entries(bindings)) {
-		pi.registerShortcut(shortcut, {
+		pi.registerShortcut(shortcut as KeyId, {
 			description: `Switch to ${binding.label ?? `${binding.provider}/${binding.model}`}`,
 			handler: async (ctx) => activateBinding(pi, ctx, shortcut, binding),
 		});
