@@ -13,8 +13,8 @@
  *     mergeProviderAttributionHeaders in the SDK's `streamFn`
  *     (pi/packages/coding-agent/src/core/provider-attribution.ts).
  *
- * Extensions that call the runtime completion facade directly — `rpiv-btw`'s
- * `/btw` is the motivating case — bypass that `streamFn`, and `completeSimple`
+ * Extensions that call the runtime completion facade directly — custom
+ * compaction and handoff one-shots, for example — bypass that `streamFn`, and `completeSimple`
  * never gets a `sessionId`, so the request reaches the gateway with no session
  * header and is rejected:
  *
@@ -46,9 +46,9 @@
  * headers, a well-formed `ses_…` session id plus `x-opencode-project` and
  * `x-opencode-request` (the other identity headers the Console logs, matching
  * `opencode/packages/opencode/src/session/llm/request.ts`), and — only for
- * tool-free contexts such as `/btw` — the four gate tool names (`bash`, `glob`,
- * `grep`, `read`) with `toolChoice: "none"`. Declaring the tools satisfies the
- * body gate while forbidding the model from calling them, so `/btw` stays
+ * tool-free contexts — the four gate tool names (`bash`, `glob`, `grep`,
+ * `read`) with `toolChoice: "none"`. Declaring the tools satisfies the body gate
+ * while forbidding the model from calling them, so the one-shot stays
  * functionally tool-free.
  *
  * Which models get the spoofed identity follows `opencode-client-spoof`'s
@@ -120,8 +120,8 @@ function zenSpoofEnabled(): boolean {
 }
 
 /**
- * Mirror `opencode-client-spoof`'s scope so a `/btw` one-shot never sends a
- * different identity than the main agent under the same account. Only the
+ * Mirror `opencode-client-spoof`'s scope so an extension one-shot never sends
+ * a different identity than the main agent under the same account. Only the
  * opt-in free-tier body spoof is separate; session-id routing is unchanged.
  */
 function shouldSpoofOneShot(model: Model<Api>): boolean {

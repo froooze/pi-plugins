@@ -2,7 +2,8 @@
  * Tests for extensions/opencode-session-id.ts.
  *
  * The extension wraps a ModelRuntime's one-shot completion entry points so that
- * extension-initiated calls (`/btw`, compaction) forward Pi's session id, which
+ * extension-initiated calls (compaction, handoff, other one-shots) forward
+ * Pi's session id, which
  * OpenCode / OpenCode Go turn into the `x-opencode-session` routing header.
  * These tests pin: injection only for the OpenCode family, caller-supplied ids
  * win, streaming entry points are untouched, the wrapper follows a session
