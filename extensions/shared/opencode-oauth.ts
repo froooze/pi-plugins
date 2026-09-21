@@ -1,15 +1,15 @@
 /**
  * shared/opencode-oauth — OpenCode Console OAuth (RFC 8628 device flow).
  *
- * OpenCode's own client no longer authenticates against the Zen gateway with a
- * static console API key alone. `opencode console login` runs a device
- * authorization against `https://opencode.ai/console` with the public
- * `opencode-cli` client id, then uses the resulting OAuth access token as the
- * bearer credential for `/zen` requests. This module gives Pi the same login
- * method so `/login opencode` offers OAuth alongside the built-in API-key
- * option. Pi's type selector labels them "Sign in with an account" (OAuth,
- * listed first) and "Sign in with an API key"; the `name` below is used as the
- * ambient-auth description.
+ * OpenCode's own client authenticates with the console account, not just a
+ * static Zen API key. `opencode console login` runs a device authorization
+ * against `https://opencode.ai/console` with the public `opencode-cli` client
+ * id and stores the resulting OAuth access token; model requests then go to
+ * the account's console inference endpoint (see "Routing" below), not `/zen`.
+ * This module gives Pi the same login method so `/login opencode` offers OAuth
+ * alongside the built-in API-key option. Pi's type selector labels them "Sign
+ * in with an account" (OAuth, listed first) and "Sign in with an API key"; the
+ * `name` below is used as the ambient-auth description.
  *
  * Flow (mirrors `packages/opencode/src/account/account.ts` and
  * `packages/core/src/plugin/provider/opencode.ts` in the OpenCode source):
@@ -22,11 +22,31 @@
  *        device_code, client_id }
  *      -> access_token, refresh_token, token_type, expires_in
  *   4. GET {console}/api/user and {console}/api/orgs with the access token,
- *      keep the first org (matching OpenCode's lexicographic selection).
+ *      keep the first org (matching `Account.poll`'s `remoteOrgs[0]`).
+ *   5. GET {console}/api/config with the access token and `x-org-id: <orgID>`
+ *      to capture where this account's models are served.
  *
- * The access token is handed to Pi as the provider API key; the OpenCode
- * provider sends it as `Authorization: Bearer …` against `opencode.ai/zen`.
- * Tokens are rotated with the refresh token via `refreshToken`.
+ * Routing (why the endpoint in step 5 matters)
+ * -------------------------------------------
+ * A console OAuth access token (`st_…`) is **not** a Zen API key. OpenCode's
+ * console proxy (`packages/console/app/src/lib/inference-proxy.ts`) accepts
+ * `/zen` and `/zen/go` only for `oc_sk_…`/`sk-…` keys; an OAuth token sent
+ * there is rejected with `401 {"type":"AuthError","message":"Invalid API key."}`.
+ * OpenCode instead requests `${console}/api/config`, sets `OPENCODE_CONSOLE_TOKEN`
+ * to the access token, and merges the remote provider config, whose `api` points
+ * at `https://opencode.ai/inference/openai/v1` and whose `options.headers` carry
+ * `x-opencode-org-id`. Every model request is a Bearer call to that inference
+ * endpoint with the org header (`packages/opencode/src/config/config.ts`).
+ *
+ * Pi's built-in `opencode`/`opencode-go` catalogs point at `/zen` and `/zen/go`,
+ * so this module projects their models onto the account's console endpoint via
+ * the legacy `oauth.modifyModels` hook: `api` -> `openai-completions`,
+ * `baseUrl` -> the remote `provider.api`, and the remote headers (org id)
+ * merged in. The account's model whitelist, when returned, filters the catalog.
+ *
+ * The access token is handed to Pi as the provider API key; openai-completions
+ * sends it as `Authorization: Bearer …`. Tokens are rotated with the refresh
+ * token via `refreshToken`.
  *
  * `opencode` (Zen) and `opencode-go` are the same console account, so this
  * module also registers for Go: its `login` adopts the Zen credential instead
@@ -34,11 +54,17 @@
  * adopt the sibling's credential when it is fresher, so a rotate-on-refresh
  * server cannot leave one provider replaying an invalidated refresh token.
  */
-import type { OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type { Api, Model, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import type { ProviderConfig } from "@earendil-works/pi-coding-agent";
 
 /** Console origin used by `opencode console login` (`defaultConsoleUrl`). */
 export const OPENCODE_CONSOLE_URL = "https://opencode.ai/console";
+
+/** Fallback console inference base, used when `/api/config` gave none. */
+export const OPENCODE_INFERENCE_BASE_URL = "https://opencode.ai/inference/openai/v1";
+
+/** Console workspace header the inference endpoint requires. */
+export const OPENCODE_ORG_HEADER = "x-opencode-org-id";
 
 /** Public device-flow client id hard-coded in the OpenCode CLI. */
 export const OPENCODE_OAUTH_CLIENT_ID = "opencode-cli";
@@ -71,10 +97,27 @@ export interface OpenCodeToken {
 	expiresInSeconds: number;
 }
 
+/**
+ * Console inference routing captured from `${console}/api/config` at login.
+ * OpenCode stores the access token in `OPENCODE_CONSOLE_TOKEN` and merges the
+ * remote provider config, so the model endpoint, its headers, and the account's
+ * model whitelist are all account-specific.
+ */
+export interface OpenCodeConsoleProjection {
+	/** Remote `provider.<id>.api` (e.g. `https://opencode.ai/inference/openai/v1`). */
+	apiUrl: string;
+	/** Remote `provider.<id>.options.headers` (carries `x-opencode-org-id`). */
+	headers: Record<string, string>;
+	/** Remote `provider.<id>.whitelist`; empty means "do not filter". */
+	models: string[];
+}
+
 export interface OpenCodeCredential {
 	access: string;
 	refresh: string;
 	expires: number;
+	/** Set for console OAuth credentials; see {@link OpenCodeConsoleProjection}. */
+	console?: OpenCodeConsoleProjection;
 	[key: string]: unknown;
 }
 
@@ -387,6 +430,104 @@ async function fetchUserOrgs(
 	};
 }
 
+function recordOrUndefined(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function stringRecord(value: unknown): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [key, entry] of Object.entries(recordOrUndefined(value) ?? {})) {
+		if (typeof entry === "string") out[key] = entry;
+	}
+	return out;
+}
+
+/**
+ * Parse `${console}/api/config` into the account's inference projection.
+ *
+ * The account config manages exactly one provider (`opencode`), whose `api` is
+ * the inference base, `options.headers` carries `x-opencode-org-id`, and
+ * `whitelist` lists the models the account may call. We prefer the canonical
+ * `opencode` entry and fall back to the first provider that has an `api`.
+ */
+export function parseConsoleProjection(raw: unknown): OpenCodeConsoleProjection | undefined {
+	const providers = recordOrUndefined(recordOrUndefined(raw)?.config)?.provider;
+	const entries = recordOrUndefined(providers);
+	if (!entries) return undefined;
+	const candidates = Object.entries(entries);
+	const selected =
+		candidates.find(([id, value]) => id === "opencode" && recordOrUndefined(value))?.[1] ??
+		candidates.find(([, value]) => recordOrUndefined(value))?.[1];
+	const entry = recordOrUndefined(selected);
+	const apiUrl = typeof entry?.api === "string" && entry.api.length > 0 ? entry.api : undefined;
+	if (!entry || !apiUrl) return undefined;
+	const whitelist = Array.isArray(entry.whitelist)
+		? entry.whitelist.filter((id): id is string => typeof id === "string" && id.length > 0)
+		: [];
+	return {
+		apiUrl,
+		headers: stringRecord(recordOrUndefined(entry.options)?.headers),
+		models: whitelist,
+	};
+}
+
+/**
+ * Read the account's console config with the OAuth access token and `x-org-id`.
+ * Best-effort: a missing/misconfigured endpoint (or a pre-migration account)
+ * leaves the credential without a projection, and callers fall back to
+ * {@link OPENCODE_INFERENCE_BASE_URL}.
+ */
+async function fetchConsoleProjection(
+	server: string,
+	access: string,
+	orgID: string | undefined,
+	fetchImpl: FetchLike,
+	signal: AbortSignal,
+): Promise<OpenCodeConsoleProjection | undefined> {
+	const headers: Record<string, string> = { Accept: "application/json", Authorization: `Bearer ${access}` };
+	if (orgID) headers["x-org-id"] = orgID;
+	const { status, body } = await fetchJson(fetchImpl, `${server}/api/config`, { headers }, signal).catch(() => ({
+		status: 0,
+		body: undefined,
+	}));
+	if (status < 200 || status >= 300) return undefined;
+	return parseConsoleProjection(body);
+}
+
+/**
+ * Project Pi's built-in `opencode`/`opencode-go` catalog onto the console
+ * account's inference endpoint.
+ *
+ * The built-in catalogs point at `opencode.ai/zen` and `opencode.ai/zen/go`,
+ * which only accept `oc_sk_…`/`sk-…` API keys; an OAuth access token there
+ * returns `401 {"type":"AuthError","message":"Invalid API key."}`. The console
+ * account instead calls `provider.api` from `/api/config` (typically
+ * `https://opencode.ai/inference/openai/v1`) as an OpenAI-compatible endpoint,
+ * with the access token as Bearer and `x-opencode-org-id` selecting the
+ * workspace. Models outside the account whitelist are hidden (OpenCode's merged
+ * config only contains the entitled models).
+ */
+export function projectConsoleModels(models: Model<Api>[], credential: OpenCodeCredential): Model<Api>[] {
+	const projection = credential.console;
+	const apiUrl = projection?.apiUrl ?? OPENCODE_INFERENCE_BASE_URL;
+	const orgID = typeof credential.orgID === "string" && credential.orgID ? credential.orgID : undefined;
+	const headers: Record<string, string> = { ...projection?.headers };
+	// The remote config already carries the header; derive it from orgID for
+	// credentials logged in before the projection was captured.
+	if (orgID && !Object.keys(headers).some((key) => key.toLowerCase() === OPENCODE_ORG_HEADER)) {
+		headers[OPENCODE_ORG_HEADER] = orgID;
+	}
+	const allowed = projection?.models && projection.models.length > 0 ? new Set(projection.models) : undefined;
+	return models
+		.filter((model) => !allowed || allowed.has(model.id))
+		.map((model) => ({
+			...model,
+			api: "openai-completions" as Api,
+			baseUrl: apiUrl,
+			headers: { ...(model.headers ?? {}), ...headers },
+		}));
+}
+
 async function refreshToken(
 	credentials: OpenCodeCredential,
 	fetchImpl: FetchLike,
@@ -466,19 +607,24 @@ async function login(
 	});
 	const token = await pollForToken(server, device, fetchImpl, signal);
 	const identity = await fetchUserOrgs(server, token.access, fetchImpl, signal);
+	const projection = await fetchConsoleProjection(server, token.access, identity.orgID, fetchImpl, signal);
 	return {
 		access: token.access,
 		refresh: token.refresh,
 		expires: Date.now() + token.expiresInSeconds * 1000,
 		server,
 		...identity,
+		...(projection ? { console: projection } : {}),
 	};
 }
 
 /**
  * Build the `oauth` block for `pi.registerProvider("opencode", …)`.
- * The access token is returned verbatim as the provider API key, so Pi sends
- * it as `Authorization: Bearer …` to the Zen endpoint.
+ *
+ * `getApiKey` returns the access token verbatim, so openai-completions sends it
+ * as `Authorization: Bearer …`; `modifyModels` rewrites the built-in `/zen`
+ * catalog onto the account's console inference endpoint (see
+ * {@link projectConsoleModels}).
  */
 export function createOpencodeOAuth(
 	options: OpenCodeOAuthOptions = {},
@@ -497,6 +643,9 @@ export function createOpencodeOAuth(
 		},
 		getApiKey(credentials) {
 			return credentials.access;
+		},
+		modifyModels(models, credentials) {
+			return projectConsoleModels(models as Model<Api>[], credentials as OpenCodeCredential);
 		},
 	};
 }

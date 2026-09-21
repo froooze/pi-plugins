@@ -5,22 +5,33 @@
  * OpenCode's own `console login`: origin-rooted verification URLs, the
  * `authorization_pending` / `slow_down` / denied classification, the
  * first-org selection, and that the access token is exposed as the provider
- * API key (Pi sends it as `Authorization: Bearer …` to `opencode.ai/zen`).
+ * API key (Pi sends it as `Authorization: Bearer …`).
+ *
+ * Also pin console routing: the OAuth token must not go to `/zen`, so
+ * `/api/config` is captured at login and `modifyModels` projects the catalog
+ * onto the account's inference endpoint with its `x-opencode-org-id` header
+ * and model whitelist (see `projectConsoleModels`).
  *
  * Run: node --experimental-strip-types --no-warnings --test test/opencode-oauth.test.ts
  */
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
 
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	OPENCODE_CONSOLE_URL,
 	OPENCODE_GO_PROVIDER,
+	OPENCODE_INFERENCE_BASE_URL,
 	OPENCODE_OAUTH_CLIENT_ID,
+	OPENCODE_ORG_HEADER,
+	type OpenCodeCredential,
 	attemptFromResponse,
 	createOpencodeOAuth,
 	normalizeConsoleUrl,
+	parseConsoleProjection,
 	parseDeviceAuth,
 	parseDeviceToken,
+	projectConsoleModels,
 	resolveVerificationUrl,
 } from "../extensions/shared/opencode-oauth.ts";
 
@@ -88,6 +99,22 @@ test("attemptFromResponse classifies the RFC 8628 states", () => {
 	assert.equal(attemptFromResponse(500, {}).status, "failed");
 });
 
+/** Minimal `${console}/api/config` body: one managed `opencode` provider. */
+const consoleConfig = {
+	config: {
+		provider: {
+			opencode: {
+				name: "Default / OpenCode",
+				npm: "@ai-sdk/openai-compatible",
+				api: "https://opencode.ai/inference/openai/v1",
+				env: ["OPENCODE_CONSOLE_TOKEN"],
+				options: { apiKey: "{env:OPENCODE_CONSOLE_TOKEN}", headers: { [OPENCODE_ORG_HEADER]: "org-b" } },
+				whitelist: ["deepseek-v4.1-flash", "glm-5.3-flash"],
+			},
+		},
+	},
+};
+
 function deviceFetch(calls: string[]): typeof fetch {
 	return async (input) => {
 		const url = typeof input === "string" ? input : input.url;
@@ -111,6 +138,7 @@ function deviceFetch(calls: string[]): typeof fetch {
 				{ id: "org-a", name: "Alpha" },
 			]);
 		}
+		if (url.endsWith("/api/config")) return json(consoleConfig);
 		return new Response("not found", { status: 404 });
 	};
 }
@@ -137,6 +165,11 @@ test("login performs the device flow and projects the credential", async () => {
 	assert.equal(credential.orgName, "Beta");
 	assert.ok(typeof credential.expires === "number" && credential.expires > Date.now());
 	assert.equal(oauth.getApiKey(credential), "access-1");
+	assert.deepEqual(credential.console, {
+		apiUrl: OPENCODE_INFERENCE_BASE_URL,
+		headers: { [OPENCODE_ORG_HEADER]: "org-b" },
+		models: ["deepseek-v4.1-flash", "glm-5.3-flash"],
+	});
 
 	assert.equal(authEvents.length, 1);
 	const auth = authEvents[0] as { url: string; instructions?: string };
@@ -290,4 +323,73 @@ test("refreshToken refreshes when the sibling is not fresher", async () => {
 	const original = { access: "access-1", refresh: "refresh-1", expires: Date.now() + 2_000_000 };
 	const refreshed = await oauth.refreshToken(original, new AbortController().signal);
 	assert.equal(refreshed.access, "access-own");
+});
+
+// ---------------------------------------------------------------------------
+// Console routing (OAuth token -> inference endpoint + org header)
+// ---------------------------------------------------------------------------
+
+const model = (id: string, overrides: Record<string, unknown> = {}) =>
+	({
+		provider: "opencode",
+		id,
+		name: id,
+		api: "openai-completions",
+		baseUrl: "https://opencode.ai/zen/v1",
+		contextWindow: 1000,
+		maxTokens: 100,
+		...overrides,
+	}) as unknown as Model<Api>;
+
+test("parseConsoleProjection reads api, org header, and whitelist", () => {
+	assert.deepEqual(parseConsoleProjection(consoleConfig), {
+		apiUrl: OPENCODE_INFERENCE_BASE_URL,
+		headers: { [OPENCODE_ORG_HEADER]: "org-b" },
+		models: ["deepseek-v4.1-flash", "glm-5.3-flash"],
+	});
+	assert.equal(parseConsoleProjection({}), undefined);
+	assert.equal(parseConsoleProjection({ config: { provider: { opencode: { name: "x" } } } }), undefined);
+});
+
+test("parseConsoleProjection falls back to the first provider with an api", () => {
+	assert.deepEqual(parseConsoleProjection({ config: { provider: { custom: { api: "https://x/inference" } } } }), {
+		apiUrl: "https://x/inference",
+		headers: {},
+		models: [],
+	});
+});
+
+test("projectConsoleModels rewrites api, baseUrl, headers and filters the whitelist", () => {
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: Date.now() + 1000,
+		console: {
+			apiUrl: OPENCODE_INFERENCE_BASE_URL,
+			headers: { [OPENCODE_ORG_HEADER]: "org-1" },
+			models: ["keep"],
+		},
+	};
+	const projected = projectConsoleModels([model("keep"), model("drop")], credential);
+	assert.equal(projected.length, 1);
+	assert.equal(projected[0]!.id, "keep");
+	assert.equal(projected[0]!.api, "openai-completions");
+	assert.equal(projected[0]!.baseUrl, OPENCODE_INFERENCE_BASE_URL);
+	assert.equal(projected[0]!.headers?.[OPENCODE_ORG_HEADER], "org-1");
+});
+
+test("projectConsoleModels derives the org header and keeps all models without a whitelist", () => {
+	const credential: OpenCodeCredential = { access: "a", refresh: "r", expires: Date.now() + 1000, orgID: "org-9" };
+	const projected = projectConsoleModels([model("a"), model("b")], credential);
+	assert.equal(projected.length, 2);
+	assert.equal(projected[0]!.baseUrl, OPENCODE_INFERENCE_BASE_URL);
+	assert.equal(projected[0]!.headers?.[OPENCODE_ORG_HEADER], "org-9");
+});
+
+test("modifyModels projects the catalog through the OAuth config", () => {
+	const oauth = createOpencodeOAuth();
+	const credential: OpenCodeCredential = { access: "a", refresh: "r", expires: Date.now() + 1000, orgID: "org-7" };
+	const projected = oauth.modifyModels!([model("a")], credential);
+	assert.equal(projected[0]!.baseUrl, OPENCODE_INFERENCE_BASE_URL);
+	assert.equal(projected[0]!.headers?.[OPENCODE_ORG_HEADER], "org-7");
 });
