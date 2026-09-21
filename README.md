@@ -42,7 +42,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `blackhole-defaults` | Warns when a project-local pi-blackhole config, a `PI_BLACKHOLE_*` env var, a project `settings.json`, or a per-model `compaction.modelOverrides` entry shadows a value enforced by `settings-defaults` |
 | `btw` | `/btw [question]` opens a side question in a **forked copy of the current session, in a new terminal window** (`pi --fork …`). The fork keeps the whole transcript and streams real thinking/tools; the main session is untouched. `/btw` alone opens Pi's multi-line editor, so formatted questions work (newlines preserved). Terminal auto-detected (tmux, xfce4-terminal, kitty, wezterm, alacritty, ghostty, konsole, gnome-terminal, xterm, macOS Terminal); `PI_BTW_LAUNCH` overrides with a `{cmd}` template, `PI_BTW_PI` overrides the `pi` binary |
 | `colored-footer` | Per-stat colored footer; extension statuses (e.g. 🗜) render inline |
-| `compact-per-model` | Per-model auto-compact thresholds (249k, luna 85% ≈ 230k) below blackhole's 300k backstop on settled runs; blackhole stays the engine |
+| `compact-per-model` | Per-model auto-compact thresholds from `shared/compaction.ts`: 295k for the listed 1M-window models (muse-spark, glm, deepseek V4), 249k fallback for unlisted models, 230k for luna (~85% of its 272k window) — all below blackhole's 300k backstop on settled runs; blackhole stays the engine |
 | `fff-guard` | Confines FFF indexing to the project cwd (never `/`/`$HOME`; scanning flags declared in `settings-defaults.json`); warns when launched from `/`/`$HOME`, plus fail-fast `rg`/`fd` fallback hints |
 | `model-hotkeys` | Alt+1…4 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json` |
 | `model-defaults` | Applies the repo-versioned startup model/thinking default from `model-defaults.json` on fresh sessions; `settings.json` is only written to drop redundant/stale mirrors, and an explicit local value always wins (`/model-defaults`) |
@@ -56,6 +56,27 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `settings-defaults` | The single applier for every file-backed plugin default. Writes each target in `settings-defaults.json` through one function: Pi `settings.json` (`retry.maxRetries=6` backfill; `compaction.keepRecentTokens=60000`, `tuiMode`, `theme` enforce), `pi-blackhole/pi-blackhole-config.json` (engine/tail/backstop/retained-output/memory), `pi-fff.json` (root/home scanning, env-mirrored). Applies after `/reload`; `/settings-defaults` status |
 | `task-notify` | OS desktop notification when a run settles (`agent_settled`, post-retry/compaction): Linux `notify-send` → `gdbus` via the freedesktop D-Bus service (works on X11 **and** Wayland, incl. KDE Plasma/KWin, GNOME, XFCE, sway/dunst), macOS `osascript`, Windows PowerShell WinRT toast. `Aborted` runs stay silent; session name + duration in the body. TUI-only; `PI_TASK_NOTIFY=off` / `PI_NOTIFICATIONS=off` opt-outs; `/notify [status\|test\|on\|off]` (`<agentDir>/task-notify.json`). Position/transparency/colors are daemon-owned, not settable via the API |
 | `todo-reconcile` | On `agent_settled`, if the `rpiv-todo` list still has open tasks, injects one follow-up telling the model to finish or reconcile them. TUI-only; aborts, exhausted errors, deferred ops, and headless/subagent/RPC sessions are skipped, one nudge per user turn (`<agentDir>/todo-reconcile.json`) |
+
+## 🌱 Branching a session: `/tree`, `/fork`, `/clone`, `/btw`
+
+Pi can branch a conversation four ways. `/tree`, `/fork`, and `/clone` are Pi built-ins; `/btw` is this package's extension.
+
+| Command | Branch point | Where the branch lives | Prompt afterward |
+|---------|--------------|------------------------|------------------|
+| `/tree` | any earlier entry | same session file (a tree node) | — |
+| `/fork` | a user message you pick | new session file, same window | selected prompt restored in the editor |
+| `/clone` | current tip | new session file, same window | empty editor |
+| `/btw` | current tip | new session file, **new terminal window** | `<question>` sent immediately (or the multi-line editor when omitted) |
+
+Pick with two questions:
+
+1. **From where?** an earlier turn (`/tree`, `/fork`) or the current tip (`/clone`, `/btw`).
+2. **Where does it go?** stay in the same file (`/tree`), take over this window (`/fork`, `/clone`), or run in parallel (`/btw`).
+
+- `/tree` — keep alternatives together in one session; switching branches can summarize the abandoned one.
+- `/fork` — go back to an earlier prompt and take a different path.
+- `/clone` — snapshot the current state and continue in the copy; the original stays as a record.
+- `/btw` — ask a side question against a full copy of the current context without disturbing the main session (see the `btw` row above for launcher details).
 
 ## 🧭 Model defaults
 

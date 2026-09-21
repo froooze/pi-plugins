@@ -241,9 +241,11 @@ export const TERMINAL_LAUNCHERS: Launcher[] = [
 		bin: "xfce4-terminal",
 		build: (p) => ({
 			command: "xfce4-terminal",
+			// NOTE: no `--window` here. With `--disable-server`, `--window` opens an
+			// extra default window alongside the command one; the server-disabled
+			// process already creates exactly one window.
 			args: [
 				"--disable-server",
-				"--window",
 				"--title",
 				p.title,
 				"--working-directory",

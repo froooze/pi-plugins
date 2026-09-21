@@ -151,6 +151,8 @@ test("selectLauncher: xfce4-terminal disables its server and passes argv verbati
 		title: "btw: hi",
 	}).args;
 	assert.ok(args.includes("--disable-server"));
+	// `--window` alongside `--disable-server` opens a second, empty window.
+	assert.ok(!args.includes("--window"));
 	assert.deepEqual(args.slice(-3), ["/s.sh", "/s.jsonl", "/q.txt"]);
 });
 
