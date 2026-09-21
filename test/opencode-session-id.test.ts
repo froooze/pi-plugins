@@ -6,8 +6,10 @@
  * OpenCode / OpenCode Go turn into the `x-opencode-session` routing header.
  * These tests pin: injection only for the OpenCode family, caller-supplied ids
  * win, streaming entry points are untouched, the wrapper follows a session
- * change without re-wrapping, and the opt-in Zen spoof (headers + gate tools +
- * `toolChoice: "none"`) fires only for free-tier Zen models when enabled.
+ * change without re-wrapping, and the Zen identity spoof follows
+ * `PI_OPENCODE_SPOOF_SCOPE` (`auto`: free always, paid under OAuth) while the
+ * free-tier body spoof (gate tools + `toolChoice: "none"`) stays behind the
+ * `PI_OPENCODE_ZEN_SPOOF` opt-in.
  *
  * Run: node --experimental-strip-types --no-warnings --test test/opencode-session-id.test.ts
  */
@@ -22,6 +24,7 @@ process.env.PI_OPENCODE_SPOOF_VERSION = "1.20.0";
 
 afterEach(() => {
 	delete process.env.PI_OPENCODE_ZEN_SPOOF;
+	delete process.env.PI_OPENCODE_SPOOF_SCOPE;
 });
 
 type Call = { method: string; model: unknown; context: unknown; options: unknown };
@@ -55,10 +58,10 @@ function makePi() {
 	};
 }
 
-function makeCtx(runtime: unknown, sessionId: string) {
+function makeCtx(runtime: unknown, sessionId: string, usingOAuth = false) {
 	return {
 		sessionManager: { getSessionId: () => sessionId },
-		modelRegistry: { runtime },
+		modelRegistry: { runtime, isUsingOAuth: () => usingOAuth },
 	};
 }
 
@@ -78,10 +81,10 @@ const opencodeZenFree = {
 } as unknown as Model<Api>;
 const anthropic = { provider: "anthropic", id: "claude", baseUrl: "https://api.anthropic.com" } as unknown as Model<Api>;
 
-function install(runtime: unknown, sessionId = "sess-1") {
+function install(runtime: unknown, sessionId = "sess-1", usingOAuth = false) {
 	const pi = makePi();
 	opencodeSessionId(pi as never);
-	pi.fire("session_start", makeCtx(runtime, sessionId));
+	pi.fire("session_start", makeCtx(runtime, sessionId, usingOAuth));
 	return pi;
 }
 
@@ -149,11 +152,36 @@ test("follows a session change without wrapping twice", async () => {
 // Opt-in Zen spoof
 // ---------------------------------------------------------------------------
 
-test("Zen spoof stays off by default (only sessionId is forwarded)", async () => {
+test("free Zen one-shots get the identity by default but no body spoof", async () => {
 	const { runtime, calls } = makeRuntime();
 	install(runtime);
 	await runtime.completeSimple(opencodeZenFree, {}, { signal: "s" });
-	assert.deepEqual(calls[0]?.options, { signal: "s", sessionId: "sess-1" });
+
+	const options = calls[0]?.options as Record<string, unknown>;
+	const headers = options.headers as Record<string, string>;
+	assert.equal(options.signal, "s");
+	assert.equal(headers["x-opencode-client"], "cli");
+	assert.match(headers["x-opencode-session"]!, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+	assert.match(headers["x-opencode-request"]!, /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+	assert.match(headers["x-opencode-project"]!, /^([0-9a-f]{40}|global)$/);
+	assert.equal(options.toolChoice, undefined);
+	assert.deepEqual(calls[0]?.context, {});
+});
+
+test("paid Zen and Go one-shots get the shared identity under OAuth", async () => {
+	const { runtime, calls } = makeRuntime();
+	install(runtime, "sess-1", true);
+	await runtime.completeSimple(opencodeZenPaid, { messages: [], tools: [{ name: "read" }] }, undefined);
+	await runtime.completeSimple(opencodeGo, { messages: [], tools: [] }, undefined);
+
+	for (const call of calls) {
+		const options = call.options as Record<string, unknown>;
+		const headers = options.headers as Record<string, string>;
+		assert.equal(headers["x-opencode-client"], "cli");
+		assert.match(headers["x-opencode-request"]!, /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+		assert.match(headers["x-opencode-project"]!, /^([0-9a-f]{40}|global)$/);
+		assert.equal(options.toolChoice, undefined, "no body gate for paid providers");
+	}
 });
 
 test("Zen spoof injects identity + gate tools + toolChoice none when enabled", async () => {
@@ -177,7 +205,7 @@ test("Zen spoof injects identity + gate tools + toolChoice none when enabled", a
 	);
 });
 
-test("Zen spoof leaves paid Zen and opencode-go alone even when enabled", async () => {
+test("Zen spoof leaves paid Zen and opencode-go alone without OAuth", async () => {
 	process.env.PI_OPENCODE_ZEN_SPOOF = "1";
 	const { runtime, calls } = makeRuntime();
 	install(runtime);

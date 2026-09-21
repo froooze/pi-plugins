@@ -46,6 +46,14 @@
  *      usually missing too. The request is therefore rejected again even with
  *      perfect headers.
  *
+ *   4. A real client also sends `x-opencode-request` (a `msg_…` id) and
+ *      `x-opencode-project` (a hash of the git remote / root commit / cached
+ *      id, or `global`). The Console logs both per request alongside the
+ *      session, client and UA (`packages/console/app/src/routes/zen/util/
+ *      handler.ts`), so sending neither is itself a distinguisher even when
+ *      the gate accepts the call. Both are spoofed here for the same reason
+ *      as the session id.
+ *
  * Pi deliberately identifies itself instead:
  *
  *   x-opencode-client: "pi"        (pi/packages/coding-agent/src/core/provider-attribution.ts)
@@ -56,14 +64,33 @@
  *
  * Scope
  * -----
- * Deliberately narrow: this only rewrites caller identity for **free-tier
- * models on the `opencode` (Zen) provider**. Paid models, `opencode-go`, and
- * every other provider are left byte-for-byte identical, so this never
- * misrepresents a paid request and is safe to keep enabled globally.
+ * Historically this rewrote caller identity only for **free-tier models on the
+ * `opencode` (Zen) provider**. That narrow scope is now the problem it was
+ * meant to avoid: the Console logs `x-opencode-client` / `User-Agent` per
+ * request and correlates them to the authenticated workspace, so an account
+ * that sends `cli` for free models and `pi` for paid ones is a signature no
+ * real OpenCode client produces (a real client sends `cli` + `opencode/*` for
+ * every Zen request).
  *
- * A model counts as free-tier when its id or display name contains "free",
- * or when its catalog cost is zero (which catches unnamed free models such as
- * `big-pickle`).
+ * The scope is therefore controlled by `PI_OPENCODE_SPOOF_SCOPE`:
+ *
+ *   - `auto` (default): free-tier Zen models plus, once a provider is
+ *     OAuth-authenticated, *every* request to that provider. Because
+ *     `opencode-go` now shares the `opencode` console account, Go requests are
+ *     spoofed too so one account keeps a single client identity across
+ *     `/zen` and `/zen/go`.
+ *   - `all`: every Zen/Go request (use with a static API key).
+ *   - `free`: historical free-tier-only behaviour.
+ *   - `off`: never spoof.
+ *
+ * Non-OpenCode providers are never spoofed. A model counts as free-tier when
+ * its id or display name contains "free", or when its catalog cost is zero
+ * (which catches unnamed free models such as `big-pickle`).
+ *
+ * Residual: the identity headers and ids are OpenCode-shaped but not
+ * byte-perfect (e.g. `x-opencode-request` is regenerated per request rather
+ * than reused per user turn), and only free-tier requests get the gate tool
+ * set. The identity is uniform, not indistinguishable.
  *
  * What this does
  * --------------
@@ -72,19 +99,21 @@
  * mergeProviderAttributionHeaders and then emits the hook), so this extension
  * can overwrite them:
  *
- *   x-opencode-client  -> "cli"
- *   User-Agent         -> "opencode/<version>"
- *   x-opencode-session -> a stable, well-formed OpenCode session id
+ *   x-opencode-client   -> "cli"
+ *   User-Agent          -> "opencode/<version>"
+ *   x-opencode-session  -> a stable, well-formed OpenCode session id
+ *   x-opencode-request  -> a well-formed `msg_…` request id
+ *   x-opencode-project  -> the repo's OpenCode project id (or "global")
  *
  * `before_provider_request` then fixes the body-level gate. Before the agent
  * starts it makes sure the request can advertise `glob` and `grep`: `glob` is
  * registered as a thin alias of Pi's built-in `find` (with a minimal schema,
  * since the gate ignores schemas), and the built-in `grep` is registered under
  * the `grep` name when the session does not already expose one (FFF, for
- * example, exposes `ffgrep` instead). Only for free-tier
- * `opencode` requests are those two names left in the outgoing payload's
- * `tools` array; every other request has the names we added stripped back out,
- * so no other provider sees a tool Pi would not normally send.
+ * example, exposes `ffgrep` instead). Those two names are left in the outgoing
+ * payload's `tools` array only for free-tier (spoofed) Zen requests; every
+ * other request has the names we added stripped back out, so no other provider
+ * sees a tool Pi would not normally send.
  *
  * Why `before_agent_start` and not `session_start`: extension `session_start`
  * handlers run in load order, and this extension loads before FFF. FFF can
@@ -105,12 +134,18 @@ import {
 	createFindToolDefinition,
 	createGrepToolDefinition,
 	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+	createOpencodeMessageId,
 	isFreeOpencodeModel,
 	opencodeSessionId,
+	parseSpoofScope,
+	resolveOpencodeProjectId,
 	resolveOpencodeVersion,
+	shouldSpoofOpencode,
+	SPOOF_SCOPE_ENV,
 	SPOOFED_CLIENT,
 } from "./shared/opencode-zen.ts";
 
@@ -187,6 +222,27 @@ function cloneToolEntry(template: unknown, name: string): unknown {
 const GLOB_TEMPLATES = ["find", "ffind", GLOB_TOOL_NAME];
 const GREP_TEMPLATES = [GREP_TOOL_NAME, "ffgrep"];
 
+/**
+ * Whether this request should carry the spoofed OpenCode identity.
+ *
+ * Scope comes from `PI_OPENCODE_SPOOF_SCOPE` (see `shared/opencode-zen.ts`).
+ * The default `auto` broadens the old free-tier-only spoof to every Zen/Go
+ * request once the provider uses OAuth, so one account never flips between the
+ * `cli` and `pi` identities the Console logs and correlates per workspace.
+ */
+function spoofsRequest(model: Model<Api> | undefined, ctx: ExtensionContext): boolean {
+	const scope = parseSpoofScope(process.env[SPOOF_SCOPE_ENV]);
+	let usingOAuth = false;
+	if (model) {
+		try {
+			usingOAuth = ctx.modelRegistry.isUsingOAuth(model);
+		} catch {
+			// Registry unavailable (e.g. stale ctx): treat as unauthenticated.
+		}
+	}
+	return shouldSpoofOpencode({ scope, model, usingOAuth });
+}
+
 /** Make sure the payload's `tools` array carries both gated search tools. */
 function ensureGateTools(payload: Record<string, unknown>): void {
 	if (!Array.isArray(payload.tools)) return;
@@ -212,14 +268,14 @@ function removeTool(payload: Record<string, unknown>, name: string): void {
 
 export default function opencodeClientSpoof(pi: ExtensionAPI) {
 	// Names this session did not originally have. Only these are stripped back
-	// out of requests that are not free-tier opencode calls.
+	// out of requests that are not spoofed opencode calls.
 	const borrowed = new Set<string>();
 
 	// The Console gate looks for tools literally named `glob` and `grep`. Pi
 	// names those capabilities `find`/`grep` (or `ffind`/`ffgrep` with FFF), so
 	// expose real `glob`/`grep` aliases when the session lacks those names.
 	// Both are invisible in the system prompt (no snippet) and only advertised
-	// for free-tier opencode requests.
+	// for spoofed opencode requests.
 	//
 	// Runs on `before_agent_start`, not `session_start`, so other extensions'
 	// `session_start` handlers have already registered their tools (see the
@@ -265,7 +321,7 @@ export default function opencodeClientSpoof(pi: ExtensionAPI) {
 		const headers = event.headers;
 		if (!headers) return;
 
-		if (!isFreeOpencodeModel(ctx.model as Model<Api> | undefined)) return;
+		if (!spoofsRequest(ctx.model as Model<Api> | undefined, ctx)) return;
 
 		// 1. Caller identity: "pi" -> "cli".
 		setHeader(headers, "x-opencode-client", SPOOFED_CLIENT);
@@ -281,6 +337,11 @@ export default function opencodeClientSpoof(pi: ExtensionAPI) {
 			piSessionId = undefined;
 		}
 		setHeader(headers, "x-opencode-session", opencodeSessionId(piSessionId));
+
+		// 4. The remaining identity headers a real CLI always sends; the Console
+		//    logs both, so omitting them is a tell (`session/llm/request.ts`).
+		setHeader(headers, "x-opencode-project", resolveOpencodeProjectId(ctx.cwd));
+		setHeader(headers, "x-opencode-request", createOpencodeMessageId());
 	});
 
 	// Body-level gate: free-tier requests must declare `glob` and `grep`. The
@@ -293,7 +354,9 @@ export default function opencodeClientSpoof(pi: ExtensionAPI) {
 		const record = payload as Record<string, unknown>;
 		const model = ctx.model as Model<Api> | undefined;
 
-		if (isFreeOpencodeModel(model)) {
+		// Only the free tier's body gate needs the extra tool names; spoofed
+		// paid Zen / Go requests keep Pi's real tool set.
+		if (model && spoofsRequest(model, ctx) && isFreeOpencodeModel(model)) {
 			ensureGateTools(record);
 			return;
 		}

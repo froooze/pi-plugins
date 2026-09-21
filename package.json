@@ -32,7 +32,7 @@
     "pi-blackhole": "https://github.com/froooze/pi-blackhole/archive/0d1c5da8c346ce467102b078bd71fba997fd4222.tar.gz"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --no-warnings --test test/local-history.test.ts test/prompt-slim.test.ts test/compaction.test.ts test/opencode-zen.test.ts test/opencode-session-id.test.ts test/todo-reconcile.test.ts test/model-defaults.test.ts test/pins.test.ts",
+    "test": "node --experimental-strip-types --no-warnings --test test/local-history.test.ts test/prompt-slim.test.ts test/compaction.test.ts test/opencode-zen.test.ts test/opencode-oauth.test.ts test/opencode-session-id.test.ts test/todo-reconcile.test.ts test/model-defaults.test.ts test/pins.test.ts",
     "test:pins": "node --experimental-strip-types --no-warnings --test test/pins.test.ts",
     "fork:split": "node scripts/fork-split.mjs"
   },

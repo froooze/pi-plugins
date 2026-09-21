@@ -41,25 +41,40 @@
  * `opencode-client-spoof` normally applies through `before_provider_headers` /
  * `before_provider_request` — hooks the runtime facade never emits.
  *
- * Setting `PI_OPENCODE_ZEN_SPOOF=1` extends this wrapper to free-tier Zen
+ * Setting `PI_OPENCODE_ZEN_SPOOF=1` extends this wrapper to spoofed Zen
  * one-shot completions: it injects the spoofed `User-Agent`/`x-opencode-client`
- * headers, a well-formed `ses_…` session id, and — only for tool-free contexts
- * such as `/btw` — the four gate tool names (`bash`, `glob`, `grep`, `read`)
- * with `toolChoice: "none"`. Declaring the tools satisfies the body gate while
- * forbidding the model from calling them, so `/btw` stays functionally
- * tool-free.
+ * headers, a well-formed `ses_…` session id plus `x-opencode-project` and
+ * `x-opencode-request` (the other identity headers the Console logs, matching
+ * `opencode/packages/opencode/src/session/llm/request.ts`), and — only for
+ * tool-free contexts such as `/btw` — the four gate tool names (`bash`, `glob`,
+ * `grep`, `read`) with `toolChoice: "none"`. Declaring the tools satisfies the
+ * body gate while forbidding the model from calling them, so `/btw` stays
+ * functionally tool-free.
  *
- * This is opt-in and unverified against the live gateway: it is unknown whether
- * Zen accepts `tool_choice: "none"` as a genuine agentic turn. Enable it only to
- * probe; paid Zen, `opencode-go`, and every other provider are never affected.
+ * Which models get the spoofed identity follows `opencode-client-spoof`'s
+ * `PI_OPENCODE_SPOOF_SCOPE` (`auto` also covers paid Zen and Go when the
+ * provider is OAuth-authenticated), so the main agent and extension one-shots
+ * never disagree on the account's client identity. Non-OpenCode providers are
+ * never affected.
+ *
+ * The free-tier *body* spoof (gate tools + `toolChoice: "none"`) remains
+ * behind `PI_OPENCODE_ZEN_SPOOF=1` and is unverified against the live gateway:
+ * it is unknown whether Zen accepts `tool_choice: "none"` as a genuine agentic
+ * turn. Paid Zen/Go one-shots get the identity headers only, matching the main
+ * agent, with no body spoof.
  */
 import type { Api, Context, Model, Tool } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	createOpencodeMessageId,
 	isFreeOpencodeModel,
 	isOpencodeModel,
 	opencodeSessionId,
+	parseSpoofScope,
+	resolveOpencodeProjectId,
 	resolveOpencodeVersion,
+	shouldSpoofOpencode,
+	SPOOF_SCOPE_ENV,
 	SPOOFED_CLIENT,
 } from "./shared/opencode-zen.ts";
 
@@ -77,6 +92,10 @@ const GATE_TOOL_NAMES = ["bash", "glob", "grep", "read"] as const;
 
 interface SessionState {
 	sessionId?: string;
+	/** Working directory, for the `x-opencode-project` value. */
+	cwd?: string;
+	/** Live registry, used at call time to tell whether `opencode` uses OAuth. */
+	modelRegistry?: ExtensionContext["modelRegistry"];
 }
 
 interface RuntimeLike {
@@ -98,6 +117,22 @@ function sessionState(): SessionState {
 function zenSpoofEnabled(): boolean {
 	const value = process.env[ZEN_SPOOF_ENV]?.trim().toLowerCase();
 	return value === "1" || value === "on" || value === "true" || value === "yes";
+}
+
+/**
+ * Mirror `opencode-client-spoof`'s scope so a `/btw` one-shot never sends a
+ * different identity than the main agent under the same account. Only the
+ * opt-in free-tier body spoof is separate; session-id routing is unchanged.
+ */
+function shouldSpoofOneShot(model: Model<Api>): boolean {
+	const scope = parseSpoofScope(process.env[SPOOF_SCOPE_ENV]);
+	let usingOAuth = false;
+	try {
+		usingOAuth = sessionState().modelRegistry?.isUsingOAuth(model) ?? false;
+	} catch {
+		// Registry unavailable (e.g. test double): treat as unauthenticated.
+	}
+	return shouldSpoofOpencode({ scope, model, usingOAuth });
 }
 
 function hasSessionId(options: unknown): boolean {
@@ -122,8 +157,15 @@ function gateTools(): Tool[] {
 	})) as Tool[];
 }
 
-/** Build the spoofed options/context for a free-tier Zen one-shot. */
-function spoofZen(model: Model<Api>, piSessionId: string, options: unknown, context: unknown) {
+/**
+ * Build the spoofed options/context for a Zen one-shot.
+ *
+ * Identity headers are always spoofed when the scope says so (so main-agent
+ * and one-shot requests never disagree). The gate tool names + `toolChoice`
+ * are only injected for free-tier models when the legacy
+ * `PI_OPENCODE_ZEN_SPOOF` opt-in is set; paid Zen needs no body spoof.
+ */
+function spoofZen(piSessionId: string, options: unknown, context: unknown, injectGateTools: boolean) {
 	const opts = (options && typeof options === "object" ? options : {}) as Record<string, unknown>;
 	const zenSessionId = opencodeSessionId(piSessionId);
 	const nextOptions: Record<string, unknown> = {
@@ -134,10 +176,12 @@ function spoofZen(model: Model<Api>, piSessionId: string, options: unknown, cont
 			"User-Agent": `opencode/${resolveOpencodeVersion()}`,
 			"x-opencode-client": SPOOFED_CLIENT,
 			"x-opencode-session": zenSessionId,
+			"x-opencode-project": resolveOpencodeProjectId(sessionState().cwd),
+			"x-opencode-request": createOpencodeMessageId(),
 		},
 	};
 	let nextContext = context;
-	if (!hasTools(context)) {
+	if (injectGateTools && !hasTools(context)) {
 		nextContext = { ...(context && typeof context === "object" ? context : {}), tools: gateTools() };
 		if (!("toolChoice" in opts)) nextOptions.toolChoice = "none";
 	}
@@ -160,8 +204,11 @@ function patchRuntime(runtime: unknown): void {
 			if (!sessionId || !isOpencodeModel(model)) {
 				return original.call(this, model, context, options);
 			}
-			if (isFreeOpencodeModel(model) && zenSpoofEnabled()) {
-				const spoofed = spoofZen(model, sessionId, options, context);
+			if (shouldSpoofOneShot(model)) {
+				// Free-tier one-shots need the body gate; keep that behind the
+				// unverified opt-in. Paid Zen only needs the identity headers.
+				const injectGateTools = isFreeOpencodeModel(model) && zenSpoofEnabled();
+				const spoofed = spoofZen(sessionId, options, context, injectGateTools);
 				return original.call(this, model, spoofed.context, spoofed.options);
 			}
 			const next = hasSessionId(options) ? options : { ...(options as object | undefined), sessionId };
@@ -177,6 +224,8 @@ function install(_event: unknown, ctx: ExtensionContext): void {
 	} catch {
 		// Stale ctx after session replacement — the previous id is still valid.
 	}
+	sessionState().modelRegistry = ctx.modelRegistry;
+	sessionState().cwd = ctx.cwd;
 	patchRuntime((ctx.modelRegistry as unknown as { runtime?: unknown }).runtime);
 }
 
