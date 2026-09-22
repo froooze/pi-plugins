@@ -1,10 +1,14 @@
 /**
- * pi-upgrade - sync and rebuild the local pi source checkout from inside pi.
+ * pi-upgrade - sync and rebuild the local pi source checkout from inside pi,
+ * then update the installed extension packages.
  *
- * Registers `/pi-upgrade` (with `--check`, `--offline`, `--force`), the
- * in-pi counterpart of the `pi-upgrade` shell command. It syncs the fork
- * (default `froooze/pi`) and rebuilds, so the npm-linked `pi` picks up the new
- * build on the next launch.
+ * Registers `/pi-upgrade` (with `--check`, `--offline`, `--force`,
+ * `--no-extensions`), the in-pi counterpart of the `pi-upgrade` shell command.
+ * It syncs the fork (default `froooze/pi`) and rebuilds, so the npm-linked `pi`
+ * picks up the new build on the next launch. Afterwards it checks for and
+ * updates installed extension packages, the in-process equivalent of
+ * `pi update --extensions` (updated extensions likewise load on the next
+ * launch).
  *
  * Implementation notes (ported from DEXBot2/scripts/update.ts):
  * - fetch + count before mutating, so "already up to date" is a clean no-op;
@@ -30,10 +34,12 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import {
+	DefaultPackageManager,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	getAgentDir,
 	getPackageDir,
+	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
 const REMOTE = process.env.PI_UPGRADE_REMOTE?.trim() || "origin";
@@ -84,11 +90,12 @@ export function resolveRepo(): string | undefined {
 
 function helpText(repo: string): string {
 	return [
-		"Usage: /pi-upgrade [--check] [--offline] [--force]",
+		"Usage: /pi-upgrade [--check] [--offline] [--force] [--no-extensions]",
 		"",
-		"  --check    report whether the fork has new commits, then exit (read-only)",
-		"  --offline  skip the network model-data refresh",
-		"  --force    rebuild even if the checkout is already up to date",
+		"  --check          report whether the fork and extensions have updates, then exit (read-only)",
+		"  --offline        skip the network model-data refresh and extension update",
+		"  --force          rebuild even if the checkout is already up to date",
+		"  --no-extensions  skip the installed-extension check/update",
 		"",
 		`Repo:   ${repo} (${REMOTE}/${BRANCH})`,
 	].join("\n");
@@ -98,6 +105,8 @@ export interface UpgradeOptions {
 	check?: boolean;
 	offline?: boolean;
 	force?: boolean;
+	/** Check and update installed extension packages (default true). */
+	extensions?: boolean;
 	/** Checkout to sync; resolved outside the pure upgrade routine. */
 	repo?: string;
 }
@@ -166,7 +175,7 @@ function lastLines(result: RunResult, count = 8): string {
 	return lines.slice(-count).join("\n");
 }
 
-function parseOptions(input: string): UpgradeOptions & { help?: boolean } {
+export function parseOptions(input: string): UpgradeOptions & { help?: boolean } {
 	const options: UpgradeOptions & { help?: boolean } = {};
 	for (const token of input.trim().split(/\s+/).filter(Boolean)) {
 		switch (token) {
@@ -178,6 +187,12 @@ function parseOptions(input: string): UpgradeOptions & { help?: boolean } {
 				break;
 			case "--force":
 				options.force = true;
+				break;
+			case "--extensions":
+				options.extensions = true;
+				break;
+			case "--no-extensions":
+				options.extensions = false;
 				break;
 			case "-h":
 			case "--help":
@@ -334,11 +349,92 @@ export async function runPiUpgrade(options: UpgradeOptions, log: Logger = () => 
 	return { ok: true, message: `pi upgraded to ${version.stdout.trim().split("\n")[0]} (${newHead}).` };
 }
 
+function createPackageManager(cwd: string, agentDir: string, projectTrusted: boolean): DefaultPackageManager {
+	const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+	return new DefaultPackageManager({ cwd, agentDir, settingsManager });
+}
+
+/** Read-only: installed extension packages that have a newer revision available. */
+export async function checkExtensionUpdates(
+	cwd: string,
+	agentDir: string,
+	projectTrusted = false,
+): Promise<string[]> {
+	const updates = await createPackageManager(cwd, agentDir, projectTrusted).checkForAvailableUpdates();
+	return updates.map((update) => update.displayName);
+}
+
+/**
+ * Update installed extension packages (the in-process equivalent of
+ * `pi update --extensions`). Returns the display names that were updated.
+ */
+export async function updateExtensions(
+	cwd: string,
+	agentDir: string,
+	projectTrusted: boolean,
+	log: Logger = () => {},
+): Promise<string[]> {
+	const available = await checkExtensionUpdates(cwd, agentDir, projectTrusted);
+	if (available.length === 0) {
+		log("extensions are up to date");
+		return [];
+	}
+
+	log(`updating ${available.length} extension package(s): ${available.join(", ")}`);
+	const manager = createPackageManager(cwd, agentDir, projectTrusted);
+	manager.setProgressCallback((event) => {
+		if (event.type === "start" && event.message) log(event.message);
+	});
+	await manager.update();
+	return available;
+}
+
+/**
+ * Fold the extension check/update into the pi result, so `/pi-upgrade` reports
+ * (and, unless `--no-extensions`, applies) both halves in one run.
+ */
+async function withExtensions(
+	piResult: UpgradeResult,
+	options: UpgradeOptions,
+	ctx: ExtensionCommandContext,
+	log: Logger,
+): Promise<UpgradeResult> {
+	const cwd = ctx.cwd;
+	const agentDir = getAgentDir();
+	const projectTrusted = ctx.isProjectTrusted();
+
+	try {
+		if (options.check) {
+			if (options.offline) {
+				return { ...piResult, message: `${piResult.message}\n\nextensions: skipped (offline)` };
+			}
+			const available = await checkExtensionUpdates(cwd, agentDir, projectTrusted);
+			const section = available.length
+				? ["", "Extensions with updates:", ...available.map((name) => `  - ${name}`), "", "Run /pi-upgrade to update."]
+				: ["", "extensions are up to date."];
+			return { ...piResult, message: `${piResult.message}\n${section.join("\n")}` };
+		}
+
+		if (options.offline) {
+			log("extensions: skipped (offline)");
+			return piResult;
+		}
+
+		const updated = await updateExtensions(cwd, agentDir, projectTrusted, log);
+		const note = updated.length ? `Updated extensions: ${updated.join(", ")}.` : "Extensions already up to date.";
+		return { ok: piResult.ok, message: `${piResult.message}\n${note}` };
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		log(`extension update failed: ${message}`);
+		return { ok: false, message: `${piResult.message}\n\nextension check/update failed: ${message}` };
+	}
+}
+
 export default function piUpgrade(pi: ExtensionAPI): void {
 	pi.registerCommand("pi-upgrade", {
-		description: "Sync and rebuild the local pi source checkout (froooze/pi)",
+		description: "Sync and rebuild the local pi source checkout (froooze/pi), then update extensions",
 		getArgumentCompletions: (prefix: string) => {
-			const options = ["--check", "--offline", "--force", "--help"];
+			const options = ["--check", "--offline", "--force", "--no-extensions", "--help"];
 			const matches = options.filter((option) => option.startsWith(prefix));
 			return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
 		},
@@ -380,6 +476,9 @@ export default function piUpgrade(pi: ExtensionAPI): void {
 			let result: UpgradeResult;
 			try {
 				result = await runPiUpgrade({ ...options, repo }, log);
+				if (options.extensions !== false) {
+					result = await withExtensions(result, options, ctx, log);
+				}
 			} catch (error) {
 				result = { ok: false, message: error instanceof Error ? error.message : String(error) };
 			} finally {
