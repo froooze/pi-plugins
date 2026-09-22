@@ -47,12 +47,21 @@
  * - `PI_TASK_NOTIFY=off|0|false` (this extension) or `PI_NOTIFICATIONS=off`
  *   (pi-wide convention) disable delivery for the process.
  *
+ * Content: the title is the session name when one is set, otherwise the
+ * source folder name (basename of the working directory); the body carries
+ * the outcome, the duration and the source path, e.g.
+ *   pi-plugins
+ *   Task complete · 1m 23s · ~/BTS/Git/pi-plugins
+ * The path is shortened against `$HOME` where possible and collapsed to one
+ * line so a notifier cannot mis-render it. Toasts stay on screen ~5s.
+ *
  * Config (optional), `<agentDir>/task-notify.json` (or
  * `$PI_CODING_AGENT_DIR/task-notify.json`):
  * {
  *   "enabled": true,
  *   "notifyOn": "both",        // "both" | "complete" | "error" | "off"
- *   "includeDuration": true,   // append "· 1m 23s" to the body
+ *   "includeDuration": true,   // append the "· 1m 23s" duration segment
+ *   "includeSourcePath": true, // append the "· ~/BTS/Git/pi-plugins" segment
  *   "minDurationMs": 0         // skip runs shorter than this
  * }
  *
@@ -63,7 +72,8 @@
  * TUI-only: headless/print/RPC sessions have no desktop to notify.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
 import {
 	getAgentDir,
 	type ExtensionAPI,
@@ -93,17 +103,21 @@ export interface NotifyConfig {
 	enabled: boolean;
 	notifyOn: NotifyOn;
 	includeDuration: boolean;
+	includeSourcePath: boolean;
 	minDurationMs: number;
 }
 
 const CONFIG_FILE_NAME = "task-notify.json";
 const APP_NAME = "pi";
 const MAX_FIELD_LEN = 200;
+/** How long the toast stays on screen, in milliseconds. */
+export const NOTIFY_EXPIRE_MS = 5000;
 
 export const DEFAULTS: NotifyConfig = {
 	enabled: true,
 	notifyOn: "both",
 	includeDuration: true,
+	includeSourcePath: true,
 	minDurationMs: 0,
 };
 
@@ -161,10 +175,63 @@ export function sanitizeText(value: string, max = MAX_FIELD_LEN): string {
 	return cleaned.length > max ? `${cleaned.slice(0, max)}…` : cleaned;
 }
 
-export function buildBody(config: NotifyConfig, outcome: NotifyOutcome, elapsedMs: number | undefined): string {
+/** Shorten an absolute path against the home directory, e.g. `~/BTS/Git/pi-plugins`. */
+export function formatSourcePath(path: string | undefined, home?: string): string | undefined {
+	if (!path || !path.trim()) return undefined; // empty/whitespace-only: no segment
+	const trimmed = path.replace(/[\\/]+$/, "");
+	if (!trimmed) return undefined;
+	const normalizedHome = home?.replace(/[\\/]+$/, "");
+	if (normalizedHome) {
+		if (trimmed === normalizedHome) return "~";
+		if (trimmed.startsWith(`${normalizedHome}/`) || trimmed.startsWith(`${normalizedHome}\\`)) {
+			return `~${trimmed.slice(normalizedHome.length)}`;
+		}
+	}
+	return trimmed;
+}
+
+/**
+ * Notification title: the session name when set, else the source folder name,
+ * else the bare app name. Always non-empty.
+ */
+export function buildTitle(
+	sessionName: string | undefined,
+	sourcePath?: string,
+	appName = APP_NAME,
+): string {
+	// sanitizeText can collapse a control-only string to "", so re-check the
+	// cleaned value before accepting it; never return an empty title.
+	const name = sessionName ? sanitizeText(sessionName) : "";
+	if (name) return name;
+	if (sourcePath) {
+		const folder = sanitizeText(basename(sourcePath.replace(/[\\/]+$/, "")));
+		if (folder) return folder;
+	}
+	return appName;
+}
+
+/**
+ * Multi-segment body: outcome, optional duration, optional source path —
+ * joined with " · " so each fact is scannable at a glance.
+ */
+/**
+ * Multi-segment body: outcome, optional duration, optional source path —
+ * joined with " · " so each fact is scannable at a glance. `sourcePath` is
+ * the raw working directory; pass `home` to shorten it to `~/…`.
+ */
+export function buildBody(
+	config: NotifyConfig,
+	outcome: NotifyOutcome,
+	elapsedMs: number | undefined,
+	sourcePath?: string,
+	home?: string,
+): string {
 	const headline = outcome === "error" ? "Stopped with error" : "Task complete";
-	if (!config.includeDuration || elapsedMs === undefined) return headline;
-	return `${headline} · ${formatDuration(elapsedMs)}`;
+	const parts = [headline];
+	if (config.includeDuration && elapsedMs !== undefined) parts.push(formatDuration(elapsedMs));
+	const path = config.includeSourcePath ? formatSourcePath(sourcePath, home) : undefined;
+	if (path) parts.push(path);
+	return parts.join(" · ");
 }
 
 /** XML-escape for the Windows toast template. */
@@ -225,7 +292,7 @@ export function buildNotifyCommands(
 			return [
 				{
 					command: "notify-send",
-					args: ["--app-name", appName, "--urgency=normal", "--expire-time=5000", title, body],
+					args: ["--app-name", appName, "--urgency=normal", `--expire-time=${NOTIFY_EXPIRE_MS}`, title, body],
 				},
 				{
 					command: "gdbus",
@@ -245,7 +312,7 @@ export function buildNotifyCommands(
 						body,
 						"[]",
 						"{}",
-						"5000",
+						String(NOTIFY_EXPIRE_MS),
 					],
 				},
 			];
@@ -278,6 +345,7 @@ export function parseConfig(raw: unknown): NotifyConfig {
 		config.notifyOn = record.notifyOn;
 	}
 	if (typeof record.includeDuration === "boolean") config.includeDuration = record.includeDuration;
+	if (typeof record.includeSourcePath === "boolean") config.includeSourcePath = record.includeSourcePath;
 	if (typeof record.minDurationMs === "number" && Number.isInteger(record.minDurationMs) && record.minDurationMs >= 0) {
 		config.minDurationMs = record.minDurationMs;
 	}
@@ -349,6 +417,14 @@ function sessionId(ctx: ExtensionContext): string | undefined {
 	}
 }
 
+function sessionName(ctx: ExtensionContext): string | undefined {
+	try {
+		return ctx.sessionManager.getSessionName();
+	} catch {
+		return undefined; // stale ctx after session replacement
+	}
+}
+
 export default function taskNotify(pi: ExtensionAPI) {
 	/** Run start time per session, for the duration suffix. */
 	const startedAt = new Map<string, number>();
@@ -373,10 +449,9 @@ export default function taskNotify(pi: ExtensionAPI) {
 			const elapsedMs = started === undefined ? undefined : Date.now() - started;
 			if (elapsedMs !== undefined && elapsedMs < config.minDurationMs) return;
 
-			const sessionName = ctx.sessionManager.getSessionName();
 			await deliver(pi, ctx, {
-				title: sessionName?.trim() ? sanitizeText(sessionName) : APP_NAME,
-				body: buildBody(config, outcome, elapsedMs),
+				title: buildTitle(sessionName(ctx), ctx.cwd),
+				body: buildBody(config, outcome, elapsedMs, ctx.cwd, homedir()),
 			});
 		} catch {
 			// A missed notification is harmless; never break the settled event.
@@ -401,7 +476,11 @@ export default function taskNotify(pi: ExtensionAPI) {
 			}
 
 			if (sub === "test") {
-				const used = await deliver(pi, ctx, { title: APP_NAME, body: "Task complete · test notification" });
+				const sourcePath = config.includeSourcePath ? formatSourcePath(ctx.cwd, homedir()) : undefined;
+				const used = await deliver(pi, ctx, {
+					title: buildTitle(sessionName(ctx), ctx.cwd),
+					body: ["Test notification", sourcePath].filter(Boolean).join(" · "),
+				});
 				ctx.ui.notify(
 					used
 						? `task-notify: test notification sent via ${used}.`
@@ -416,7 +495,8 @@ export default function taskNotify(pi: ExtensionAPI) {
 				: "";
 			ctx.ui.notify(
 				`task-notify: ${config.enabled ? "enabled" : "disabled"}, notifyOn=${config.notifyOn}, ` +
-					`duration=${config.includeDuration ? "on" : "off"}, min=${config.minDurationMs}ms${suppressed}. ` +
+					`duration=${config.includeDuration ? "on" : "off"}, ` +
+					`source=${config.includeSourcePath ? "on" : "off"}, min=${config.minDurationMs}ms${suppressed}. ` +
 					`Backends: ${describeNotifyBackends()}. Config: ${configPath()}. TUI-only.`,
 				"info",
 			);

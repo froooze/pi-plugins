@@ -9,12 +9,15 @@ import { test } from "node:test";
 import {
 	buildBody,
 	buildNotifyCommands,
+	buildTitle,
 	classifyStopReason,
 	DEFAULTS,
 	describeNotifyBackends,
 	formatDuration,
+	formatSourcePath,
 	isNotificationSuppressed,
 	lastAssistantStopReason,
+	NOTIFY_EXPIRE_MS,
 	parseConfig,
 	powershellNotifyCommand,
 	sanitizeText,
@@ -97,6 +100,45 @@ test("buildBody: headline, optional duration suffix", () => {
 	assert.equal(buildBody(config({ includeDuration: false }), "complete", 83_000), "Task complete");
 });
 
+test("buildBody: appends source path, gated by includeSourcePath", () => {
+	assert.equal(
+		buildBody(config(), "complete", 83_000, "/home/alex/BTS/Git/pi-plugins"),
+		"Task complete · 1m 23s · /home/alex/BTS/Git/pi-plugins",
+	);
+	assert.equal(
+		buildBody(config({ includeSourcePath: false }), "complete", 83_000, "/home/alex/BTS/Git/pi-plugins"),
+		"Task complete · 1m 23s",
+	);
+	assert.equal(buildBody(config(), "complete", undefined, "/tmp/x"), "Task complete · /tmp/x");
+	// home shortens the path once, in buildBody itself
+	assert.equal(
+		buildBody(config(), "complete", 83_000, "/home/alex/BTS/Git/pi-plugins", "/home/alex"),
+		"Task complete · 1m 23s · ~/BTS/Git/pi-plugins",
+	);
+	// a whitespace-only path adds no trailing segment
+	assert.equal(buildBody(config(), "complete", 83_000, "   "), "Task complete · 1m 23s");
+});
+
+test("formatSourcePath: collapses trailing slashes and shortens against home", () => {
+	assert.equal(formatSourcePath(undefined), undefined);
+	assert.equal(formatSourcePath("/"), undefined);
+	assert.equal(formatSourcePath("   "), undefined);
+	assert.equal(formatSourcePath("/tmp/x/"), "/tmp/x");
+	assert.equal(formatSourcePath("/home/alex/BTS/Git/pi-plugins", "/home/alex"), "~/BTS/Git/pi-plugins");
+	assert.equal(formatSourcePath("/home/alex", "/home/alex"), "~");
+	assert.equal(formatSourcePath("/home/alexander/x", "/home/alex"), "/home/alexander/x");
+});
+
+test("buildTitle: session name wins, then project folder, then app name", () => {
+	assert.equal(buildTitle("my session", "/home/alex/BTS/Git/pi-plugins"), "my session");
+	assert.equal(buildTitle("  ", "/home/alex/BTS/Git/pi-plugins"), "pi-plugins");
+	assert.equal(buildTitle(undefined, "/home/alex/BTS/Git/pi-plugins/"), "pi-plugins");
+	assert.equal(buildTitle(undefined, undefined), "pi");
+	// control-only names sanitize to "" and must fall through, never emit an empty title
+	assert.equal(buildTitle("\u0001\u0002", "/x/y"), "y");
+	assert.equal(buildTitle(undefined, "/\u0001\u0002"), "pi");
+});
+
 test("sanitizeText: strips control chars, collapses whitespace, caps length", () => {
 	assert.equal(sanitizeText("  a\u0000b\n\tc  "), "a b c");
 	const long = sanitizeText("x".repeat(500));
@@ -117,6 +159,13 @@ test("buildNotifyCommands: linux prefers notify-send then gdbus", () => {
 	assert.ok(cmds[1].args.includes("org.freedesktop.Notifications.Notify"));
 	assert.ok(cmds[1].args.includes("t"));
 	assert.ok(cmds[1].args.includes("b"));
+});
+
+test("buildNotifyCommands: toasts request the shared expire time on Linux", () => {
+	const cmds = buildNotifyCommands("linux", { title: "t", body: "b" });
+	assert.equal(NOTIFY_EXPIRE_MS, 5000);
+	assert.ok(cmds[0].args.includes(`--expire-time=${NOTIFY_EXPIRE_MS}`));
+	assert.equal(cmds[1].args[cmds[1].args.length - 1], String(NOTIFY_EXPIRE_MS));
 });
 
 test("buildNotifyCommands: darwin uses osascript display notification", () => {
@@ -186,12 +235,22 @@ test("parseConfig: defaults for non-objects and corrupt shapes", () => {
 });
 
 test("parseConfig: applies valid fields and rejects invalid ones", () => {
-	assert.deepEqual(parseConfig({ enabled: false, notifyOn: "error", includeDuration: false, minDurationMs: 5000 }), {
-		enabled: false,
-		notifyOn: "error",
-		includeDuration: false,
-		minDurationMs: 5000,
-	});
+	assert.deepEqual(
+		parseConfig({
+			enabled: false,
+			notifyOn: "error",
+			includeDuration: false,
+			includeSourcePath: false,
+			minDurationMs: 5000,
+		}),
+		{
+			enabled: false,
+			notifyOn: "error",
+			includeDuration: false,
+			includeSourcePath: false,
+			minDurationMs: 5000,
+		},
+	);
 	assert.deepEqual(parseConfig({ notifyOn: "bogus" }), DEFAULTS);
 	assert.deepEqual(parseConfig({ minDurationMs: -1 }), DEFAULTS);
 	assert.deepEqual(parseConfig({ minDurationMs: 1.5 }), DEFAULTS);

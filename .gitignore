@@ -7,3 +7,4 @@ dist/
 
 # local-history undo sidecars (`--no-session` resolves the session dir to cwd)
 local-history/
+research/
