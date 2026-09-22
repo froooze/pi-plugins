@@ -58,17 +58,41 @@ export function extractDocsPaths(systemPrompt: string): DocsPaths | undefined {
 export const DROPPED_GUIDELINE_SUBSTRINGS: Readonly<Record<string, readonly string[]>> = {
 	// `update` action + its example are documented by the tool description and
 	// TodoParamsSchema; `includeDeleted`/`status` are schema fields; the subject
-	// rule is a soft preference.
+	// rule is a soft preference. The 4-state-machine sentence repeats the tool
+	// description ("Status: pending → …, plus deleted tombstone"), the `status`
+	// enum description (all four states + list filter) and the `activeForm`
+	// description (present-continuous label hint).
 	todo: [
 		"To change a task's status",
 		"list hides tombstoned",
 		"Subject must be short and imperative",
+		"Task status is a 4-state machine",
 	],
+	// Guideline #1 restates recall's description plus the `query`/`mode`/`scope`
+	// parameter descriptions almost line-for-line (#N paging, 12-char hex ids,
+	// mode names, scope). Accepted loss: its one unique sentence, "If no
+	// results, try fewer terms or a regex pattern".
 	// "Only full-file writes are indexed" is repeated in recall's `query`
 	// parameter description.
-	recall: ["when a drill-down path matches multiple files"],
-	// Redundant cross-reference / niche alternative to a plain glob.
-	fffind: ["use for paths, not content", "to list everything inside a directory"],
+	recall: [
+		"when a drill-down path matches multiple files",
+		"literal text/regex search across session history",
+	],
+	// Redundant cross-reference / niche alternative to a plain glob. The
+	// `use exclude` nudge repeats the `exclude` parameter description (same
+	// 'test/,*.min.js' example).
+	fffind: [
+		"use for paths, not content",
+		"to list everything inside a directory",
+		"use exclude:",
+	],
+	// `path` repeats the `path`/`exclude` parameter descriptions (identical
+	// examples); `caseSensitive` repeats its parameter description ("Default
+	// uses smart-case") and the tool description already says "Smart-case".
+	ffgrep: ["use path for include", "caseSensitive: true when you need exact case"],
+	// Restates the prompt snippet ("exact text replacement") and the tool
+	// description ("must match a unique, non-overlapping region").
+	edit: ["Use edit for precise changes"],
 	// Niche; PI_* env vars are discoverable when needed.
 	bash: ["inspect PI_* environment variables"],
 };

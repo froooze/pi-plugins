@@ -46,6 +46,7 @@ test("pruneGuidelines drops known redundant bullets and keeps the rest", () => {
 			"To change a task's status, call update with the task id",
 			"list hides tombstoned (deleted) tasks by default",
 			"Subject must be short and imperative",
+			"Task status is a 4-state machine: pending → in_progress → completed",
 		],
 		recall: [
 			"Use recall — literal text/regex search across session history",
@@ -56,16 +57,38 @@ test("pruneGuidelines drops known redundant bullets and keeps the rest", () => {
 			"fffind: use for paths, not content. Use ffgrep for content.",
 			"fffind: use exclude: 'test/,*.min.js' to cut noise",
 		],
+		ffgrep: [
+			"ffgrep: prefer bare identifiers as patterns. Literal queries are most efficient.",
+			"ffgrep: use path for include ('src/', '*.ts') and exclude for noise ('test/,*.min.js').",
+			"ffgrep: caseSensitive: true when you need exact case (smart-case otherwise).",
+			"ffgrep: after 1-2 greps, read the top match instead of more greps.",
+		],
+		edit: [
+			"Use edit for precise changes (edits[].oldText must match exactly)",
+			"Each edits[].oldText is matched against the original file, not after earlier edits are applied.",
+		],
 		bash: ["You can inspect PI_* environment variables for current model and session details."],
 		read: ["Use read to examine files instead of cat or sed."],
 	};
 
 	const removed = pruneGuidelines(guidelines);
 
-	assert.equal(removed, 3 + 1 + 1 + 1);
+	// todo 4/5, recall 2/2, fffind 2/3, ffgrep 2/4, edit 1/2, bash 1/1.
+	assert.equal(removed, 4 + 2 + 2 + 2 + 1 + 1);
 	assert.deepEqual(guidelines.todo, ["Use `todo` for complex work with 3+ steps"]);
-	assert.equal(guidelines.recall.length, 1);
-	assert.equal(guidelines.fffind.length, 2);
+	assert.deepEqual(guidelines.recall, []);
+	assert.deepEqual(guidelines.fffind, [
+		"fffind: matches the WHOLE path, not just the filename",
+	]);
+	assert.deepEqual(guidelines.ffgrep, [
+		"ffgrep: prefer bare identifiers as patterns. Literal queries are most efficient.",
+		"ffgrep: after 1-2 greps, read the top match instead of more greps.",
+	]);
+	// Only the snippet/description restatement is dropped; the "matched against
+	// the original file" semantics bullet survives.
+	assert.deepEqual(guidelines.edit, [
+		"Each edits[].oldText is matched against the original file, not after earlier edits are applied.",
+	]);
 	assert.deepEqual(guidelines.bash, []);
 	// Untouched tools pass through unchanged.
 	assert.deepEqual(guidelines.read, ["Use read to examine files instead of cat or sed."]);
