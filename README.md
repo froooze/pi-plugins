@@ -31,7 +31,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | Dir | What |
 |-----|------|
 | `extensions/` | TypeScript extensions (`.ts`, auto-discovered) — see own extensions below |
-| `skills/` | Agent skills (`*/SKILL.md`) |
+| `skills/` | Agent skills (`*/SKILL.md`) — bundled: `ketch` research playbook (vendored from `1broseidon/ketch` v0.18.0, MIT, `skills/ketch/LICENSE`) |
 | `prompts/` | Prompt templates (`.md`) |
 | `themes/` | TUI themes (`.json`) — currently `dark-white-footer` |
 
@@ -44,6 +44,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `colored-footer` | Per-stat colored footer; extension statuses (e.g. 🗜) render inline |
 | `compact-per-model` | Per-model auto-compact thresholds from `shared/compaction.ts`: 295k for the listed 1M-window models (muse-spark, glm, deepseek V4), 249k fallback for unlisted models, 230k for luna (~85% of its 272k window), 165k for mimo-v2.6-flash-free (82.5% of its 200k window; the 249k fallback would sit above that window) — all below blackhole's 300k backstop on settled runs; blackhole stays the engine |
 | `fff-guard` | Confines FFF indexing to the project cwd (never `/`/`$HOME`; scanning flags declared in `settings-defaults.json`); warns when launched from `/`/`$HOME`, plus fail-fast `rg`/`fd` fallback hints |
+| `ketch-setup` | `/ketch` status for the [ketch](https://ketch.run) research CLI (resolved binary, `ketch version --json`, `ketch config` backend/keys, `ketch doctor --json` summary incl. problem rows and the blocking exit-5 marker) and `/ketch setup`: install **without a Go toolchain** (SHA-256-verified release download against `checksums.txt`, Homebrew, or npm — propose → confirm → run), repair the GOMAXPROCS wrapper this host's 0/0 cgroup quota needs (Go 1.25 container-aware GOMAXPROCS aborts with `procresize: invalid arg`; all extension spawns inject `GOMAXPROCS` defensively anyway), enter optional API keys straight into a spawned `ketch config set` so they never reach the model context or the transcript, then re-run doctor per upstream's confirm step; passive fs-only missing-binary warning once per install (`PI_KETCH_SETUP=off`, `<agentDir>/ketch-setup.json`) |
 | `model-hotkeys` | Alt+1…5 model switching (`/model-hotkeys`); bindings in `model-hotkeys.json`, falling back to the bundled copy when no local one exists |
 | `model-defaults` | Applies the repo-versioned startup model/thinking default from `model-defaults.json` on fresh sessions; `settings.json` is only written to drop redundant/stale mirrors, and an explicit local value always wins (`/model-defaults`) |
 | `local-history` | Per-turn file `/undo`/`/redo` + `/local-history` status via sidecar before-images next to the session file (no git, no tokens, `edit`/`write` only) |
