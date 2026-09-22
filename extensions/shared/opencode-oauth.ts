@@ -122,7 +122,22 @@ export interface OpenCodeConsoleProjection {
 	api?: Api;
 	/** Per-model `provider.npm`/`provider.api` overrides, keyed by model id. */
 	modelRoutes?: Record<string, OpenCodeConsoleModelRoute>;
+	/**
+	 * Unix ms of the last successful `/api/config` refresh. Entitlements move
+	 * server-side, so the projection is re-read from `${console}/api/config`
+	 * once this is older than {@link CONSOLE_PROJECTION_TTL_MS}; see
+	 * {@link consoleProjectionStale}.
+	 */
+	checkedAt?: number;
 }
+
+/**
+ * How long a stored console projection is trusted before a startup refetch.
+ * The account's model whitelist and per-model routing change server-side, so a
+ * projection that is never re-read would keep filtering out newly entitled
+ * models (e.g. a free-tier swap) until the next re-login.
+ */
+export const CONSOLE_PROJECTION_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface OpenCodeCredential {
 	access: string;
@@ -574,6 +589,77 @@ export async function loadConsoleProjection(
 	const orgID = typeof credential.orgID === "string" && credential.orgID ? credential.orgID : undefined;
 	const signal = options.signal ?? new AbortController().signal;
 	return fetchConsoleProjection(server, credential.access, orgID, options.fetch ?? globalThis.fetch, signal);
+}
+
+/**
+ * Whether a stored projection should be re-read from `/api/config`: absent, or
+ * last checked at/before `now - ttlMs` (or with no recorded `checkedAt`, which
+ * covers credentials from before the field and pre-migration projections).
+ */
+export function consoleProjectionStale(
+	credential: OpenCodeCredential | undefined,
+	now: number,
+	ttlMs: number = CONSOLE_PROJECTION_TTL_MS,
+): boolean {
+	const checkedAt = credential?.console?.checkedAt;
+	if (typeof checkedAt !== "number" || !Number.isFinite(checkedAt)) return true;
+	return now - checkedAt >= ttlMs;
+}
+
+function sortedStringRecord(record: Record<string, string> | undefined): Record<string, string> {
+	return Object.fromEntries(Object.entries(record ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function canonicalModelRoutes(
+	routes: Record<string, OpenCodeConsoleModelRoute> | undefined,
+): Record<string, OpenCodeConsoleModelRoute> | null {
+	if (!routes) return null;
+	const canonical: Record<string, OpenCodeConsoleModelRoute> = {};
+	for (const id of Object.keys(routes).sort()) {
+		const route = routes[id];
+		canonical[id] = { ...(route.api ? { api: route.api } : {}), ...(route.apiUrl ? { apiUrl: route.apiUrl } : {}) };
+	}
+	return canonical;
+}
+
+/**
+ * Canonical payload of a projection, excluding `checkedAt`. Key order in
+ * `headers`/`modelRoutes` is not semantic, so it is normalized before the
+ * comparison.
+ */
+function consoleProjectionPayload(projection: OpenCodeConsoleProjection | undefined): string {
+	if (!projection) return "";
+	return JSON.stringify({
+		apiUrl: projection.apiUrl,
+		headers: sortedStringRecord(projection.headers),
+		models: [...projection.models],
+		api: projection.api ?? null,
+		modelRoutes: canonicalModelRoutes(projection.modelRoutes),
+	});
+}
+
+/** True when two projections differ in anything except the refresh timestamp. */
+export function consoleProjectionDiffers(
+	current: OpenCodeConsoleProjection | undefined,
+	fetched: OpenCodeConsoleProjection | undefined,
+): boolean {
+	return consoleProjectionPayload(current) !== consoleProjectionPayload(fetched);
+}
+
+/**
+ * Stamp a freshly fetched projection with `now` and merge it into a credential.
+ * `changed` reports whether the model-affecting payload actually moved (so
+ * callers can skip a model-registry refresh when only the timestamp advanced).
+ */
+export function mergeConsoleProjection(
+	credential: OpenCodeCredential,
+	fetched: OpenCodeConsoleProjection,
+	now: number,
+): { credential: OpenCodeCredential; changed: boolean } {
+	return {
+		credential: { ...credential, console: { ...fetched, checkedAt: now } },
+		changed: consoleProjectionDiffers(credential.console, fetched),
+	};
 }
 
 /**

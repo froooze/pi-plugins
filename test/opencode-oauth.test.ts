@@ -19,15 +19,20 @@ import { test } from "node:test";
 
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
+	CONSOLE_PROJECTION_TTL_MS,
 	OPENCODE_CONSOLE_URL,
 	OPENCODE_GO_PROVIDER,
 	OPENCODE_INFERENCE_BASE_URL,
 	OPENCODE_OAUTH_CLIENT_ID,
 	OPENCODE_ORG_HEADER,
+	type OpenCodeConsoleProjection,
 	type OpenCodeCredential,
 	apiFromProviderNpm,
 	attemptFromResponse,
+	consoleProjectionDiffers,
+	consoleProjectionStale,
 	createOpencodeOAuth,
+	mergeConsoleProjection,
 	normalizeConsoleUrl,
 	parseConsoleProjection,
 	parseDeviceAuth,
@@ -476,4 +481,102 @@ test("modifyModels projects the catalog through the OAuth config", () => {
 	const projected = oauth.modifyModels!([model("a")], credential);
 	assert.equal(projected[0]!.baseUrl, OPENCODE_INFERENCE_BASE_URL);
 	assert.equal(projected[0]!.headers?.[OPENCODE_ORG_HEADER], "org-7");
+});
+
+const projection = (overrides: Partial<OpenCodeConsoleProjection> = {}): OpenCodeConsoleProjection => ({
+	apiUrl: OPENCODE_INFERENCE_BASE_URL,
+	headers: { [OPENCODE_ORG_HEADER]: "org-1" },
+	models: ["mimo-v2.5-free"],
+	...overrides,
+});
+
+test("consoleProjectionStale treats absent/undated projections as stale and honors the TTL", () => {
+	const now = 1_000_000_000_000;
+	assert.equal(consoleProjectionStale(undefined, now), true);
+	assert.equal(consoleProjectionStale({ access: "a", refresh: "r", expires: now }, now), true);
+	assert.equal(
+		consoleProjectionStale({ access: "a", refresh: "r", expires: now, console: projection() }, now),
+		true,
+		"a projection with no checkedAt predates the throttle",
+	);
+	assert.equal(
+		consoleProjectionStale(
+			{ access: "a", refresh: "r", expires: now, console: { ...projection(), checkedAt: now } },
+			now,
+		),
+		false,
+	);
+	assert.equal(
+		consoleProjectionStale(
+			{
+				access: "a",
+				refresh: "r",
+				expires: now,
+				console: { ...projection(), checkedAt: now - CONSOLE_PROJECTION_TTL_MS + 1 },
+			},
+			now,
+		),
+		false,
+	);
+	assert.equal(
+		consoleProjectionStale(
+			{
+				access: "a",
+				refresh: "r",
+				expires: now,
+				console: { ...projection(), checkedAt: now - CONSOLE_PROJECTION_TTL_MS },
+			},
+			now,
+		),
+		true,
+		"the TTL boundary refreshes",
+	);
+});
+
+test("consoleProjectionDiffers ignores checkedAt and non-semantic key order", () => {
+	assert.equal(consoleProjectionDiffers(undefined, projection()), true);
+	assert.equal(consoleProjectionDiffers(undefined, undefined), false);
+	assert.equal(consoleProjectionDiffers(projection(), projection()), false);
+	assert.equal(
+		consoleProjectionDiffers(
+			projection({ headers: { a: "1", b: "2" } }),
+			projection({ headers: { b: "2", a: "1" } }),
+		),
+		false,
+		"header key order is not semantic",
+	);
+	assert.equal(
+		consoleProjectionDiffers(
+			projection({ modelRoutes: { a: { api: "openai-responses" }, b: { api: "anthropic-messages" } } }),
+			projection({ modelRoutes: { b: { api: "anthropic-messages" }, a: { api: "openai-responses" } } }),
+		),
+		false,
+		"modelRoutes key order is not semantic",
+	);
+	assert.equal(
+		consoleProjectionDiffers(
+			projection({ ...projection(), checkedAt: 1 }),
+			projection({ ...projection(), checkedAt: 2 }),
+		),
+		false,
+		"a timestamp bump alone is not a change",
+	);
+	assert.equal(consoleProjectionDiffers(projection(), projection({ models: ["mimo-v2.6-flash-free"] })), true);
+	assert.equal(consoleProjectionDiffers(projection(), projection({ api: "openai-responses" })), true);
+});
+
+test("mergeConsoleProjection stamps checkedAt and reports model-affecting changes", () => {
+	const now = 1_000_000_000_000;
+	const credential: OpenCodeCredential = { access: "a", refresh: "r", expires: now, console: projection() };
+
+	const unchanged = mergeConsoleProjection(credential, projection(), now);
+	assert.equal(unchanged.changed, false);
+	assert.equal(unchanged.credential.console?.checkedAt, now);
+	assert.equal(unchanged.credential.access, "a");
+
+	const refreshed = projection({ models: ["mimo-v2.6-flash-free"] });
+	const changed = mergeConsoleProjection(credential, refreshed, now);
+	assert.equal(changed.changed, true);
+	assert.deepEqual(changed.credential.console?.models, ["mimo-v2.6-flash-free"]);
+	assert.equal(changed.credential.console?.checkedAt, now);
 });

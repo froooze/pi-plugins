@@ -47,6 +47,10 @@
  *   credential object so `/login` shows both as `✓ stored`. If both exist but
  *   differ, it warns and leaves them alone (`/opencode set <key>` unifies on
  *   one API key; `/login opencode-go` aligns them on the OAuth account).
+ * - On `session_start` it re-reads the account's console projection from
+ *   `${console}/api/config` when the stored one is missing or older than a
+ *   day, so entitlement changes (e.g. a new free model) appear without a
+ *   re-login. `/opencode refresh` forces the same fetch on demand.
  * - After every write it refreshes just those two providers so the login list
  *   flips to `✓ stored` immediately, without a restart.
  *
@@ -67,8 +71,10 @@ import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard, getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import {
+	consoleProjectionStale,
 	createOpencodeOAuth,
 	loadConsoleProjection,
+	mergeConsoleProjection,
 	OPENCODE_GO_PROVIDER,
 	type OpenCodeCredential,
 } from "./shared/opencode-oauth.ts";
@@ -206,50 +212,93 @@ function siblingOAuthReader(provider: string): () => OpenCodeCredential | undefi
 }
 
 /**
- * Backfill a pre-migration OAuth credential's console projection (inference
- * endpoint + per-model wire API) from `${console}/api/config`, so an account
- * logged in before per-model routing was captured (or before a server-side
- * change) picks up Responses-only models without a re-login. Returns true when
- * auth.json changed.
+ * Re-read the account's console projection (inference endpoint, per-model wire
+ * API, model whitelist) from `${console}/api/config` and persist it.
  *
- * Best-effort and startup-only: runs once per process, skips API-key setups and
- * `--offline`, and leaves auth.json untouched when the fetch fails.
+ * The whitelist moves server-side (free-tier swaps, newly added models), so a
+ * projection captured at login would keep hiding newly entitled models until
+ * the next re-login. A missing or stale projection is therefore refreshed at
+ * startup once per {@link CONSOLE_PROJECTION_TTL_MS}; `force` skips the TTL for
+ * the `/opencode refresh` command. Returns `{ refreshed, changed }`:
+ * `refreshed` is false when there is nothing to do or the fetch failed, and
+ * `changed` reports whether the model-affecting payload moved (so callers only
+ * refresh the model registry when it did).
+ *
+ * Best-effort: skips API-key setups and `--offline` (unless forced), and leaves
+ * auth.json untouched when the fetch fails.
  */
-async function backfillConsoleProjection(): Promise<boolean> {
-	if (process.env.PI_OFFLINE) return false;
+async function refreshConsoleProjection(force = false): Promise<{ refreshed: boolean; changed: boolean }> {
+	const skipped = { refreshed: false, changed: false };
+	if (!force && process.env.PI_OFFLINE) return skipped;
+
 	const path = authPath();
-	const needsBackfill = PROVIDERS.some((provider) => {
-		const credential = readStoredCredential(provider, path);
-		if (!isOAuthCredential(credential)) return false;
-		const block = (credential as Record<string, unknown>).console;
-		return !(
-			block &&
-			typeof block === "object" &&
-			(block as Record<string, unknown>).modelRoutes
-		);
-	});
-	if (!needsBackfill) return false;
+	const now = Date.now();
+	const data = loadAuthFile(path);
+	const oauthProviders = PROVIDERS.filter((provider) => isOAuthCredential(data[provider]));
+	if (oauthProviders.length === 0) return skipped;
+
+	if (
+		!force &&
+		!oauthProviders.some((provider) => consoleProjectionStale(data[provider] as OpenCodeCredential, now))
+	) {
+		return skipped;
+	}
 
 	const source = siblingOAuthReader(ZEN)() ?? siblingOAuthReader(GO)();
-	if (!source) return false;
+	if (!source) return skipped;
 	const projection = await loadConsoleProjection(source, { signal: AbortSignal.timeout(5000) });
-	if (!projection) return false;
+	if (!projection) return skipped;
 
-	const data = loadAuthFile(path);
 	let changed = false;
-	for (const provider of PROVIDERS) {
-		const current = data[provider];
-		if (!isOAuthCredential(current)) continue;
-		data[provider] = { ...(current as Record<string, unknown>), console: projection };
-		changed = true;
+	for (const provider of oauthProviders) {
+		const merged = mergeConsoleProjection(data[provider] as OpenCodeCredential, projection, now);
+		data[provider] = merged.credential;
+		changed = changed || merged.changed;
 	}
-	if (!changed) return false;
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, {
 		encoding: "utf-8",
 		mode: 0o600,
 	});
-	return true;
+	return { refreshed: true, changed };
+}
+
+/**
+ * `/opencode refresh`: force a projection re-read and report whether the
+ * entitlement/routing payload moved. Recovers from a stale whitelist (e.g. a
+ * newly entitled free model) without a re-login.
+ */
+async function refreshConsoleProjectionCommand(ctx: ExtensionCommandContext): Promise<void> {
+	let result: { refreshed: boolean; changed: boolean };
+	try {
+		result = await refreshConsoleProjection(true);
+	} catch (error) {
+		const message = `Could not refresh the OpenCode console projection: ${
+			error instanceof Error ? error.message : String(error)
+		}`;
+		if (!ctx.hasUI) throw new Error(message);
+		ctx.ui.notify(message, "error");
+		return;
+	}
+
+	if (!result.refreshed) {
+		const message =
+			"Could not read the OpenCode console projection (no OAuth credential, or the console was unreachable). " +
+			"The stored projection was kept.";
+		if (!ctx.hasUI) throw new Error(message);
+		ctx.ui.notify(message, "warning");
+		return;
+	}
+
+	if (result.changed) await refreshOpencode(ctx);
+	report(
+		ctx,
+		`${
+			result.changed
+				? "Console projection updated (model whitelist/routing refreshed)."
+				: "Console projection re-read; nothing changed."
+		}\n${statusLine(ctx)}`,
+	);
 }
 
 function statusLine(ctx: ExtensionCommandContext): string {
@@ -355,7 +404,7 @@ async function applyApiKey(
 	}
 }
 
-const SUBCOMMANDS = ["copy", "status", "help", "set"] as const;
+const SUBCOMMANDS = ["copy", "refresh", "status", "help", "set"] as const;
 
 /** True when the word is an obvious typo of a subcommand, e.g. `stats`, `coppy`.
  * Only the abbreviation direction counts (`stat` -> `status`). Never the reverse,
@@ -381,12 +430,19 @@ async function handleOpencode(args: string, ctx: ExtensionCommandContext): Promi
 	const word = arg.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
 
 	if (isNearMissSubcommand(word)) {
-		warnOrThrow(ctx, `Unknown subcommand "${word}". Try /opencode status, /opencode copy, /opencode help.`);
+		warnOrThrow(
+			ctx,
+			`Unknown subcommand "${word}". Try /opencode status, /opencode refresh, /opencode copy, /opencode help.`,
+		);
 		return;
 	}
 
 	if (word === "copy") {
 		await copyCurrentKey(ctx);
+		return;
+	}
+	if (word === "refresh") {
+		await refreshConsoleProjectionCommand(ctx);
 		return;
 	}
 	if (word === "status") {
@@ -399,6 +455,7 @@ async function handleOpencode(args: string, ctx: ExtensionCommandContext): Promi
 			"/opencode — OpenCode credentials (OAuth is the default)\n" +
 				"/opencode status — show Zen/Go credential type\n" +
 				"/opencode copy — copy the current credential to clipboard\n" +
+				"/opencode refresh — re-read the account's model whitelist/routing now\n" +
 				"/opencode set <key> — explicitly save one API key for Zen + Go\n" +
 				"/login opencode — sign in with the OpenCode Console account (OAuth)",
 		);
@@ -525,7 +582,7 @@ export default function opencodeLogin(pi: ExtensionAPI) {
 	pi.registerCommand("opencode", {
 		description: "Manage OpenCode credentials (OAuth default; /opencode set <key> for an API key)",
 		getArgumentCompletions: (prefix: string) => {
-			const options = ["copy", "status", "help", "set"];
+			const options = ["copy", "refresh", "status", "help", "set"];
 			const matches = options.filter((opt) => opt.startsWith(prefix.toLowerCase()));
 			if (matches.length === 0) return null;
 			return matches.map((value) => ({
@@ -534,11 +591,13 @@ export default function opencodeLogin(pi: ExtensionAPI) {
 				description:
 					value === "copy"
 						? "Copy the current credential"
-						: value === "status"
-							? "Show Zen/Go auth status (OAuth vs API key)"
-							: value === "set"
-								? "Explicitly save an API key (Zen + Go)"
-								: "Show usage",
+						: value === "refresh"
+							? "Re-read the console model whitelist/routing"
+							: value === "status"
+								? "Show Zen/Go auth status (OAuth vs API key)"
+								: value === "set"
+									? "Explicitly save an API key (Zen + Go)"
+									: "Show usage",
 			}));
 		},
 		handler,
@@ -604,13 +663,13 @@ export default function opencodeLogin(pi: ExtensionAPI) {
 			);
 		}
 
-		let projectionUpdated = false;
+		let projectionChanged = false;
 		try {
-			projectionUpdated = await backfillConsoleProjection();
+			projectionChanged = (await refreshConsoleProjection()).changed;
 		} catch {
-			// Backfill is best effort; a failed fetch leaves auth.json unchanged.
+			// Refresh is best effort; a failed fetch leaves auth.json unchanged.
 		}
-		if (!mirrored && !projectionUpdated) return;
+		if (!mirrored && !projectionChanged) return;
 		try {
 			await ctx.modelRegistry.refresh({ allowNetwork: false, providers: [...PROVIDERS] });
 		} catch {
