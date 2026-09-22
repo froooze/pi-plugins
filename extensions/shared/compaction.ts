@@ -32,6 +32,16 @@ export const COMPACT_PER_MODEL_1M = 295_000;
 export const COMPACT_PER_MODEL_LUNA = 230_000;
 
 /**
+ * Auto-compact threshold (tokens) for `mimo-v2.6-flash-free`: 82.5% of its
+ * 200k context window (200k × 0.825 = 165k). The unlisted-model fallback (249k)
+ * sits *above* this model's window, so without an explicit entry the per-model
+ * trigger could never fire before the provider's 200k wall. The remaining 35k
+ * headroom still exceeds the model's 32k max output, so a full-output turn
+ * after the `agent_end` evaluation lands under the window.
+ */
+export const COMPACT_PER_MODEL_MIMO = 165_000;
+
+/**
  * Fallback auto-compact threshold (tokens) for models not listed in
  * `compact-per-model.ts`. Kept conservative because an unlisted model may have
  * a small window; explicitly listed 1M-window models use
