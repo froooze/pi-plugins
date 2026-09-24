@@ -21,10 +21,12 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	CONSOLE_PROJECTION_TTL_MS,
 	OPENCODE_CONSOLE_URL,
+	OPENCODE_GO_INFERENCE_BASE_URL,
 	OPENCODE_GO_PROVIDER,
 	OPENCODE_INFERENCE_BASE_URL,
 	OPENCODE_OAUTH_CLIENT_ID,
 	OPENCODE_ORG_HEADER,
+	type OpenCodeConsoleModelDefinition,
 	type OpenCodeConsoleProjection,
 	type OpenCodeCredential,
 	apiFromProviderNpm,
@@ -105,7 +107,7 @@ test("attemptFromResponse classifies the RFC 8628 states", () => {
 	assert.equal(attemptFromResponse(500, {}).status, "failed");
 });
 
-/** Minimal `${console}/api/config` body: one managed `opencode` provider. */
+/** Minimal `${console}/api/config` body: one account, two provider entries. */
 const consoleConfig = {
 	config: {
 		provider: {
@@ -116,6 +118,14 @@ const consoleConfig = {
 				env: ["OPENCODE_CONSOLE_TOKEN"],
 				options: { apiKey: "{env:OPENCODE_CONSOLE_TOKEN}", headers: { [OPENCODE_ORG_HEADER]: "org-b" } },
 				whitelist: ["deepseek-v4.1-flash", "glm-5.3-flash"],
+			},
+			"opencode-go": {
+				name: "Default / OpenCode Go",
+				npm: "@ai-sdk/openai-compatible",
+				api: OPENCODE_GO_INFERENCE_BASE_URL,
+				env: ["OPENCODE_CONSOLE_TOKEN"],
+				options: { apiKey: "{env:OPENCODE_CONSOLE_TOKEN}", headers: { [OPENCODE_ORG_HEADER]: "org-b" } },
+				whitelist: ["deepseek-v4.1-flash", "grok-4.7"],
 			},
 		},
 	},
@@ -172,6 +182,7 @@ test("login performs the device flow and projects the credential", async () => {
 	assert.ok(typeof credential.expires === "number" && credential.expires > Date.now());
 	assert.equal(oauth.getApiKey(credential), "access-1");
 	assert.deepEqual(credential.console, {
+		provider: "opencode",
 		apiUrl: OPENCODE_INFERENCE_BASE_URL,
 		headers: { [OPENCODE_ORG_HEADER]: "org-b" },
 		models: ["deepseek-v4.1-flash", "glm-5.3-flash"],
@@ -262,12 +273,8 @@ const noopCallbacks = (events: unknown[] = []) => ({
 	onSelect: async () => undefined,
 });
 
-test("opencode-go login adopts the sibling opencode credential without fetching", async () => {
+test("opencode-go login adopts the sibling credential and reads Go's own projection", async () => {
 	const calls: string[] = [];
-	const fetchImpl: typeof fetch = async (input) => {
-		calls.push(typeof input === "string" ? input : input.url);
-		return new Response("unexpected", { status: 500 });
-	};
 	const sibling = {
 		access: "access-1",
 		refresh: "refresh-1",
@@ -277,13 +284,38 @@ test("opencode-go login adopts the sibling opencode credential without fetching"
 	};
 	const oauth = createOpencodeOAuth({
 		provider: OPENCODE_GO_PROVIDER,
-		fetch: fetchImpl,
+		fetch: deviceFetch(calls),
 		readSibling: () => sibling,
 	});
 	const credential = await oauth.login(noopCallbacks());
-	assert.equal(credential.access, "access-1");
+	assert.equal(credential.access, "access-1", "the sibling token is reused");
 	assert.equal(credential.refresh, "refresh-1");
-	assert.equal(calls.length, 0, "adoption must not hit the network");
+	assert.equal(credential.accountID, "user-1");
+	assert.equal(credential.console?.provider, "opencode-go");
+	assert.equal(credential.console?.apiUrl, OPENCODE_GO_INFERENCE_BASE_URL, "Go's endpoint, not Zen's");
+	assert.deepEqual(credential.console?.models, ["deepseek-v4.1-flash", "grok-4.7"], "Go's whitelist");
+	assert.deepEqual(calls, [`${OPENCODE_CONSOLE_URL}/api/config`], "no second device flow");
+});
+
+test("opencode-go login drops a sibling projection when the config fetch fails", async () => {
+	const oauth = createOpencodeOAuth({
+		provider: OPENCODE_GO_PROVIDER,
+		fetch: async () => new Response("unexpected", { status: 500 }),
+		readSibling: () => ({
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: Date.now() + 3_600_000,
+			console: {
+				provider: "opencode",
+				apiUrl: OPENCODE_INFERENCE_BASE_URL,
+				headers: {},
+				models: ["zen-only"],
+			},
+		}),
+	});
+	const credential = await oauth.login(noopCallbacks());
+	assert.equal(credential.access, "access-1");
+	assert.equal(credential.console, undefined, "Zen's projection is not reused for Go");
 });
 
 test("opencode login ignores a sibling and runs the device flow", async () => {
@@ -349,12 +381,25 @@ const model = (id: string, overrides: Record<string, unknown> = {}) =>
 
 test("parseConsoleProjection reads api, org header, and whitelist", () => {
 	assert.deepEqual(parseConsoleProjection(consoleConfig), {
+		provider: "opencode",
 		apiUrl: OPENCODE_INFERENCE_BASE_URL,
 		headers: { [OPENCODE_ORG_HEADER]: "org-b" },
 		models: ["deepseek-v4.1-flash", "glm-5.3-flash"],
 	});
 	assert.equal(parseConsoleProjection({}), undefined);
 	assert.equal(parseConsoleProjection({ config: { provider: { opencode: { name: "x" } } } }), undefined);
+});
+
+test("parseConsoleProjection selects the requested provider's entry", () => {
+	const go = parseConsoleProjection(consoleConfig, OPENCODE_GO_PROVIDER);
+	assert.equal(go?.provider, "opencode-go");
+	assert.equal(go?.apiUrl, OPENCODE_GO_INFERENCE_BASE_URL);
+	assert.deepEqual(go?.models, ["deepseek-v4.1-flash", "grok-4.7"]);
+	assert.equal(
+		parseConsoleProjection(consoleConfig, "missing")?.provider,
+		"opencode",
+		"an unknown provider falls back to the canonical opencode entry",
+	);
 });
 
 test("apiFromProviderNpm maps OpenCode SDK packages to Pi APIs", () => {
@@ -395,6 +440,161 @@ test("parseConsoleProjection captures per-model provider routing", () => {
 		},
 	});
 	assert.equal(projection?.api, undefined, "openai-compatible is the implicit default");
+});
+
+test("parseConsoleProjection normalizes whitelisted model definitions", () => {
+	const parsed = parseConsoleProjection({
+		config: {
+			provider: {
+				opencode: {
+					api: OPENCODE_INFERENCE_BASE_URL,
+					npm: "@ai-sdk/openai-compatible",
+					whitelist: ["space-bunny-free", "known"],
+					models: {
+						"space-bunny-free": {
+							name: "Space Bunny Free",
+							reasoning: true,
+							modalities: { input: ["text", "image", "video"], output: ["text"] },
+							cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+							limit: { context: 1_048_576, input: 524_288, output: 524_288 },
+							provider: { npm: "@ai-sdk/openai" },
+						},
+						known: {
+							name: "Known",
+							modalities: { input: ["text"] },
+							limit: { context: 1000, output: 100 },
+						},
+						"not-entitled": { name: "Nope", limit: { context: 5, output: 5 } },
+					},
+				},
+			},
+		},
+	});
+	assert.deepEqual(parsed?.definitions, {
+		"space-bunny-free": {
+			name: "Space Bunny Free",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_048_576,
+			maxTokens: 524_288,
+		},
+		known: {
+			name: "Known",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000,
+			maxTokens: 100,
+		},
+	});
+	assert.equal(parsed?.modelRoutes?.["space-bunny-free"]?.api, "openai-responses");
+});
+
+test("projectConsoleModels appends whitelist-only models Pi's catalog lacks", () => {
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: Date.now() + 1000,
+		console: {
+			apiUrl: OPENCODE_INFERENCE_BASE_URL,
+			headers: { [OPENCODE_ORG_HEADER]: "org-1" },
+			models: ["mimo-v2.5-free", "space-bunny-free"],
+			definitions: {
+				"mimo-v2.5-free": definition(),
+				"space-bunny-free": definition({
+					name: "Space Bunny Free",
+					reasoning: true,
+					input: ["text", "image"],
+					contextWindow: 1_048_576,
+					maxTokens: 524_288,
+				}),
+			},
+			modelRoutes: { "space-bunny-free": { api: "openai-responses" } },
+		},
+	};
+	const projected = projectConsoleModels([model("mimo-v2.5-free")], credential);
+	assert.deepEqual(
+		projected.map((entry) => entry.id),
+		["mimo-v2.5-free", "space-bunny-free"],
+	);
+	const bunny = projected[1]!;
+	assert.equal(bunny.name, "Space Bunny Free");
+	assert.equal(bunny.provider, "opencode");
+	assert.equal(bunny.api, "openai-responses");
+	assert.equal(bunny.baseUrl, OPENCODE_INFERENCE_BASE_URL);
+	assert.equal(bunny.reasoning, true);
+	assert.deepEqual(bunny.input, ["text", "image"]);
+	assert.equal(bunny.contextWindow, 1_048_576);
+	assert.equal(bunny.maxTokens, 524_288);
+	assert.equal(bunny.headers?.[OPENCODE_ORG_HEADER], "org-1");
+});
+
+test("projectConsoleModels labels synthesized models with the requested provider", () => {
+	const oauth = createOpencodeOAuth({ provider: OPENCODE_GO_PROVIDER });
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: Date.now() + 1000,
+		console: {
+			apiUrl: OPENCODE_INFERENCE_BASE_URL,
+			headers: {},
+			models: ["space-bunny-free"],
+			definitions: { "space-bunny-free": definition({ name: "Space Bunny Free" }) },
+		},
+	};
+	const projected = oauth.modifyModels!([model("other", { provider: "opencode-go" })], credential);
+	assert.deepEqual(
+		projected.map((entry) => entry.id),
+		["space-bunny-free"],
+	);
+	assert.equal(projected[0]!.provider, "opencode-go");
+});
+
+test("projectConsoleModels does not duplicate a whitelist-only model already in the catalog", () => {
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: Date.now() + 1000,
+		console: {
+			apiUrl: OPENCODE_INFERENCE_BASE_URL,
+			headers: {},
+			models: ["space-bunny-free"],
+			definitions: { "space-bunny-free": definition({ name: "Ignored" }) },
+		},
+	};
+	const projected = projectConsoleModels([model("space-bunny-free")], credential);
+	assert.deepEqual(
+		projected.map((entry) => entry.id),
+		["space-bunny-free"],
+	);
+	assert.equal(projected[0]!.name, "space-bunny-free");
+});
+
+test("projectConsoleModels ignores a projection captured for the sibling provider", () => {
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: Date.now() + 1000,
+		console: {
+			provider: "opencode",
+			apiUrl: OPENCODE_INFERENCE_BASE_URL,
+			headers: {},
+			models: ["zen-only"],
+			definitions: { "zen-only": definition() },
+		},
+	};
+	const projected = projectConsoleModels(
+		[model("go-only", { provider: OPENCODE_GO_PROVIDER })],
+		credential,
+		OPENCODE_GO_PROVIDER,
+	);
+	assert.deepEqual(
+		projected.map((entry) => entry.id),
+		["go-only"],
+		"Zen's whitelist is not applied to Go",
+	);
+	assert.equal(projected[0]!.baseUrl, OPENCODE_GO_INFERENCE_BASE_URL, "Go's inference base");
 });
 
 test("projectConsoleModels routes openai() models to the Responses API", () => {
@@ -442,6 +642,7 @@ test("projectConsoleModels uses a per-model apiUrl override", () => {
 
 test("parseConsoleProjection falls back to the first provider with an api", () => {
 	assert.deepEqual(parseConsoleProjection({ config: { provider: { custom: { api: "https://x/inference" } } } }), {
+		provider: "custom",
 		apiUrl: "https://x/inference",
 		headers: {},
 		models: [],
@@ -483,10 +684,22 @@ test("modifyModels projects the catalog through the OAuth config", () => {
 	assert.equal(projected[0]!.headers?.[OPENCODE_ORG_HEADER], "org-7");
 });
 
+const definition = (overrides: Partial<OpenCodeConsoleModelDefinition> = {}): OpenCodeConsoleModelDefinition => ({
+	name: "MiMo",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 1000,
+	maxTokens: 100,
+	...overrides,
+});
+
 const projection = (overrides: Partial<OpenCodeConsoleProjection> = {}): OpenCodeConsoleProjection => ({
+	provider: "opencode",
 	apiUrl: OPENCODE_INFERENCE_BASE_URL,
 	headers: { [OPENCODE_ORG_HEADER]: "org-1" },
 	models: ["mimo-v2.5-free"],
+	definitions: { "mimo-v2.5-free": definition() },
 	...overrides,
 });
 
@@ -563,6 +776,53 @@ test("consoleProjectionDiffers ignores checkedAt and non-semantic key order", ()
 	);
 	assert.equal(consoleProjectionDiffers(projection(), projection({ models: ["mimo-v2.6-flash-free"] })), true);
 	assert.equal(consoleProjectionDiffers(projection(), projection({ api: "openai-responses" })), true);
+	assert.equal(
+		consoleProjectionDiffers(
+			projection(),
+			projection({ definitions: { "mimo-v2.5-free": definition({ name: "Renamed" }) } }),
+		),
+		true,
+		"definition changes are model-affecting",
+	);
+});
+
+test("consoleProjectionStale refreshes projections captured without definitions", () => {
+	const now = 1_000_000_000_000;
+	const legacy: OpenCodeConsoleProjection = {
+		apiUrl: OPENCODE_INFERENCE_BASE_URL,
+		headers: {},
+		models: ["mimo-v2.5-free"],
+		checkedAt: now,
+	};
+	assert.equal(
+		consoleProjectionStale({ access: "a", refresh: "r", expires: now, console: legacy }, now),
+		true,
+		"a pre-definition projection migrates once",
+	);
+	assert.equal(
+		consoleProjectionStale(
+			{ access: "a", refresh: "r", expires: now, console: { ...legacy, definitions: {} } },
+			now,
+		),
+		false,
+		"carrying the definitions field is enough to trust the stored projection on TTL",
+	);
+});
+
+test("consoleProjectionStale treats the sibling provider's projection as stale", () => {
+	const now = 1_000_000_000_000;
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: now,
+		console: { ...projection(), checkedAt: now },
+	};
+	assert.equal(consoleProjectionStale(credential, now, CONSOLE_PROJECTION_TTL_MS, "opencode"), false);
+	assert.equal(
+		consoleProjectionStale(credential, now, CONSOLE_PROJECTION_TTL_MS, OPENCODE_GO_PROVIDER),
+		true,
+		"a Zen projection must not satisfy Go",
+	);
 });
 
 test("mergeConsoleProjection stamps checkedAt and reports model-affecting changes", () => {

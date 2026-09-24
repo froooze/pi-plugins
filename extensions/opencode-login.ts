@@ -71,6 +71,7 @@ import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard, getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import {
+	CONSOLE_PROJECTION_TTL_MS,
 	consoleProjectionStale,
 	createOpencodeOAuth,
 	loadConsoleProjection,
@@ -239,22 +240,34 @@ async function refreshConsoleProjection(force = false): Promise<{ refreshed: boo
 
 	if (
 		!force &&
-		!oauthProviders.some((provider) => consoleProjectionStale(data[provider] as OpenCodeCredential, now))
+		!oauthProviders.some((provider) =>
+			consoleProjectionStale(data[provider] as OpenCodeCredential, now, CONSOLE_PROJECTION_TTL_MS, provider),
+		)
 	) {
 		return skipped;
 	}
 
 	const source = siblingOAuthReader(ZEN)() ?? siblingOAuthReader(GO)();
 	if (!source) return skipped;
-	const projection = await loadConsoleProjection(source, { signal: AbortSignal.timeout(5000) });
-	if (!projection) return skipped;
 
+	// Zen and Go share the account but have distinct `/api/config` entries
+	// (different inference endpoint and whitelist), so read the projection per
+	// provider instead of applying one entry to both.
 	let changed = false;
+	let refreshed = false;
 	for (const provider of oauthProviders) {
+		const projection = await loadConsoleProjection(source, {
+			signal: AbortSignal.timeout(5000),
+			provider,
+		});
+		if (!projection) continue;
+		refreshed = true;
 		const merged = mergeConsoleProjection(data[provider] as OpenCodeCredential, projection, now);
 		data[provider] = merged.credential;
 		changed = changed || merged.changed;
 	}
+	if (!refreshed) return skipped;
+
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, {
 		encoding: "utf-8",

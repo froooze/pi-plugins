@@ -33,16 +33,19 @@
  * `/zen` and `/zen/go` only for `oc_sk_…`/`sk-…` keys; an OAuth token sent
  * there is rejected with `401 {"type":"AuthError","message":"Invalid API key."}`.
  * OpenCode instead requests `${console}/api/config`, sets `OPENCODE_CONSOLE_TOKEN`
- * to the access token, and merges the remote provider config, whose `api` points
- * at `https://opencode.ai/inference/openai/v1` and whose `options.headers` carry
- * `x-opencode-org-id`. Every model request is a Bearer call to that inference
- * endpoint with the org header (`packages/opencode/src/config/config.ts`).
+ * to the access token, and merges the remote provider config. Each provider
+ * entry (`opencode`, `opencode-go`) carries its own `api` inference base
+ * (`https://opencode.ai/inference/openai/v1` and `.../inference/go/openai/v1`)
+ * and `options.headers` with `x-opencode-org-id`. Every model request is a
+ * Bearer call to that provider's inference endpoint with the org header
+ * (`packages/opencode/src/config/config.ts`).
  *
  * Pi's built-in `opencode`/`opencode-go` catalogs point at `/zen` and `/zen/go`,
  * so this module projects their models onto the account's console endpoint via
  * the legacy `oauth.modifyModels` hook: `api` -> `openai-completions`,
  * `baseUrl` -> the remote `provider.api`, and the remote headers (org id)
- * merged in. The account's model whitelist, when returned, filters the catalog.
+ * merged in. Each provider entry's model whitelist, when returned, filters that
+ * provider's catalog.
  *
  * The access token is handed to Pi as the provider API key; openai-completions
  * sends it as `Authorization: Bearer …`. Tokens are rotated with the refresh
@@ -62,6 +65,9 @@ export const OPENCODE_CONSOLE_URL = "https://opencode.ai/console";
 
 /** Fallback console inference base, used when `/api/config` gave none. */
 export const OPENCODE_INFERENCE_BASE_URL = "https://opencode.ai/inference/openai/v1";
+
+/** Fallback console inference base for `opencode-go`, used when `/api/config` gave none. */
+export const OPENCODE_GO_INFERENCE_BASE_URL = "https://opencode.ai/inference/go/openai/v1";
 
 /** Console workspace header the inference endpoint requires. */
 export const OPENCODE_ORG_HEADER = "x-opencode-org-id";
@@ -106,12 +112,37 @@ export interface OpenCodeConsoleModelRoute {
 }
 
 /**
+ * Model metadata captured from `provider.<id>.models.<model>`, normalized to the
+ * fields Pi's catalog needs. Pi's built-in `opencode`/`opencode-go` catalogs lag
+ * the console (a model can be entitled before it reaches the `pi.dev` catalog),
+ * so these definitions let {@link projectConsoleModels} synthesize a
+ * whitelist-only entry instead of dropping it.
+ */
+export interface OpenCodeConsoleModelDefinition {
+	/** Display name (`models.<id>.name`); falls back to the id when absent. */
+	name?: string;
+	reasoning: boolean;
+	/** `modalities.input` filtered to what Pi accepts; always includes `text`. */
+	input: ("text" | "image")[];
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	contextWindow: number;
+	maxTokens: number;
+}
+
+/**
  * Console inference routing captured from `${console}/api/config` at login.
  * OpenCode stores the access token in `OPENCODE_CONSOLE_TOKEN` and merges the
  * remote provider config, so the model endpoint, its headers, and the account's
  * model whitelist are all account-specific.
  */
 export interface OpenCodeConsoleProjection {
+	/**
+	 * Console provider id this projection was read from (`opencode` or
+	 * `opencode-go`). The two share one console account but expose different
+	 * inference endpoints and whitelists, so a projection whose `provider`
+	 * does not match the provider it is applied to is ignored and refreshed.
+	 */
+	provider?: string;
 	/** Remote `provider.<id>.api` (e.g. `https://opencode.ai/inference/openai/v1`). */
 	apiUrl: string;
 	/** Remote `provider.<id>.options.headers` (carries `x-opencode-org-id`). */
@@ -122,6 +153,13 @@ export interface OpenCodeConsoleProjection {
 	api?: Api;
 	/** Per-model `provider.npm`/`provider.api` overrides, keyed by model id. */
 	modelRoutes?: Record<string, OpenCodeConsoleModelRoute>;
+	/**
+	 * Normalized metadata for whitelisted models, keyed by model id, used to
+	 * synthesize catalog entries for whitelist-only ids. Absent on projections
+	 * captured before definitions were retained; {@link consoleProjectionStale}
+	 * treats those as stale so they migrate on the next refresh.
+	 */
+	definitions?: Record<string, OpenCodeConsoleModelDefinition>;
 	/**
 	 * Unix ms of the last successful `/api/config` refresh. Entitlements move
 	 * server-side, so the projection is re-read from `${console}/api/config`
@@ -138,6 +176,11 @@ export interface OpenCodeConsoleProjection {
  * models (e.g. a free-tier swap) until the next re-login.
  */
 export const CONSOLE_PROJECTION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Fallback context window for a synthesized model whose console `limit` is absent. */
+const SYNTHETIC_FALLBACK_CONTEXT_WINDOW = 128_000;
+/** Fallback max output for a synthesized model whose console `limit` is absent. */
+const SYNTHETIC_FALLBACK_MAX_TOKENS = 32_768;
 
 export interface OpenCodeCredential {
 	access: string;
@@ -510,25 +553,86 @@ function parseModelRoutes(value: unknown): Record<string, OpenCodeConsoleModelRo
 	return routes;
 }
 
+function finiteNumber(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+/**
+ * Normalize a `provider.<id>.models.<model>` entry to the fields Pi's catalog
+ * needs. Missing fields fall back to conservative defaults so a whitelist-only
+ * model still lists (the console entry always carries `limit` and `cost` today).
+ */
+function parseModelDefinition(value: unknown): OpenCodeConsoleModelDefinition {
+	const model = recordOrUndefined(value) ?? {};
+	const modalities = recordOrUndefined(model.modalities);
+	const rawInput = Array.isArray(modalities?.input) ? modalities.input : [];
+	const input: ("text" | "image")[] = [];
+	if (rawInput.includes("text")) input.push("text");
+	if (rawInput.includes("image")) input.push("image");
+	if (input.length === 0) input.push("text");
+	const cost = recordOrUndefined(model.cost);
+	const limit = recordOrUndefined(model.limit);
+	const contextWindow = Math.max(finiteNumber(limit?.context, SYNTHETIC_FALLBACK_CONTEXT_WINDOW), 1);
+	const maxTokens = Math.max(finiteNumber(limit?.output, Math.min(contextWindow, SYNTHETIC_FALLBACK_MAX_TOKENS)), 1);
+	return {
+		...(typeof model.name === "string" && model.name.length > 0 ? { name: model.name } : {}),
+		reasoning: model.reasoning === true,
+		input,
+		cost: {
+			input: finiteNumber(cost?.input, 0),
+			output: finiteNumber(cost?.output, 0),
+			cacheRead: finiteNumber(cost?.cache_read, 0),
+			cacheWrite: finiteNumber(cost?.cache_write, 0),
+		},
+		contextWindow,
+		maxTokens,
+	};
+}
+
+/**
+ * Read normalized definitions for the whitelisted ids from an `entry.models`
+ * map. Only entitled ids are retained (the remote map lists every model the
+ * console knows); the rest would bloat auth.json for no benefit.
+ */
+function parseModelDefinitions(
+	value: unknown,
+	whitelist: readonly string[],
+): Record<string, OpenCodeConsoleModelDefinition> {
+	const models = recordOrUndefined(value);
+	if (!models) return {};
+	const definitions: Record<string, OpenCodeConsoleModelDefinition> = {};
+	for (const id of whitelist) {
+		const model = recordOrUndefined(models[id]);
+		if (model) definitions[id] = parseModelDefinition(model);
+	}
+	return definitions;
+}
+
 /**
  * Parse `${console}/api/config` into the account's inference projection.
  *
- * The account config manages exactly one provider (`opencode`), whose `api` is
- * the inference base, `options.headers` carries `x-opencode-org-id`, and
- * `whitelist` lists the models the account may call. Per-model `provider`
+ * The account config lists one entry per provider (`opencode`, `opencode-go`),
+ * each with its own `api` inference base, `options.headers` carrying
+ * `x-opencode-org-id`, and `whitelist` listing the models the account may call.
+ * Per-model `provider`
  * blocks decide the wire API (Responses vs chat completions, see
- * {@link apiFromProviderNpm}). We prefer the canonical `opencode` entry and
- * fall back to the first provider that has an `api`.
+ * {@link apiFromProviderNpm}), and the remaining per-model fields are retained
+ * as {@link OpenCodeConsoleModelDefinition}s. The requested provider's entry
+ * wins; otherwise we prefer the canonical `opencode` entry and fall back to the
+ * first provider that has an `api`. Each entry has its own `api`, `whitelist`,
+ * and model map, so the chosen id is recorded as {@link
+ * OpenCodeConsoleProjection.provider}.
  */
-export function parseConsoleProjection(raw: unknown): OpenCodeConsoleProjection | undefined {
+export function parseConsoleProjection(raw: unknown, providerId?: string): OpenCodeConsoleProjection | undefined {
 	const providers = recordOrUndefined(recordOrUndefined(raw)?.config)?.provider;
 	const entries = recordOrUndefined(providers);
 	if (!entries) return undefined;
 	const candidates = Object.entries(entries);
 	const selected =
-		candidates.find(([id, value]) => id === "opencode" && recordOrUndefined(value))?.[1] ??
-		candidates.find(([, value]) => recordOrUndefined(value))?.[1];
-	const entry = recordOrUndefined(selected);
+		(providerId ? candidates.find(([id, value]) => id === providerId && recordOrUndefined(value)) : undefined) ??
+		candidates.find(([id, value]) => id === "opencode" && recordOrUndefined(value)) ??
+		candidates.find(([, value]) => recordOrUndefined(value));
+	const entry = recordOrUndefined(selected?.[1]);
 	const apiUrl = typeof entry?.api === "string" && entry.api.length > 0 ? entry.api : undefined;
 	if (!entry || !apiUrl) return undefined;
 	const whitelist = Array.isArray(entry.whitelist)
@@ -536,13 +640,16 @@ export function parseConsoleProjection(raw: unknown): OpenCodeConsoleProjection 
 		: [];
 	const api = apiFromProviderNpm(typeof entry.npm === "string" ? entry.npm : undefined);
 	const modelRoutes = parseModelRoutes(entry.models);
+	const definitions = parseModelDefinitions(entry.models, whitelist);
 	return {
+		...(selected?.[0] ? { provider: selected[0] } : {}),
 		apiUrl,
 		headers: stringRecord(recordOrUndefined(entry.options)?.headers),
 		models: whitelist,
 		// `openai-completions` is the implicit default; only record a different one.
 		...(api && api !== "openai-completions" ? { api } : {}),
 		...(Object.keys(modelRoutes).length > 0 ? { modelRoutes } : {}),
+		...(Object.keys(definitions).length > 0 ? { definitions } : {}),
 	};
 }
 
@@ -558,6 +665,7 @@ async function fetchConsoleProjection(
 	orgID: string | undefined,
 	fetchImpl: FetchLike,
 	signal: AbortSignal,
+	providerId?: string,
 ): Promise<OpenCodeConsoleProjection | undefined> {
 	const headers: Record<string, string> = { Accept: "application/json", Authorization: `Bearer ${access}` };
 	if (orgID) headers["x-org-id"] = orgID;
@@ -566,7 +674,7 @@ async function fetchConsoleProjection(
 		body: undefined,
 	}));
 	if (status < 200 || status >= 300) return undefined;
-	return parseConsoleProjection(body);
+	return parseConsoleProjection(body, providerId);
 }
 
 /**
@@ -580,7 +688,7 @@ async function fetchConsoleProjection(
  */
 export async function loadConsoleProjection(
 	credential: OpenCodeCredential,
-	options: { fetch?: FetchLike; signal?: AbortSignal } = {},
+	options: { fetch?: FetchLike; signal?: AbortSignal; provider?: string } = {},
 ): Promise<OpenCodeConsoleProjection | undefined> {
 	const rawServer = credential.server;
 	const server = normalizeConsoleUrl(
@@ -588,21 +696,40 @@ export async function loadConsoleProjection(
 	);
 	const orgID = typeof credential.orgID === "string" && credential.orgID ? credential.orgID : undefined;
 	const signal = options.signal ?? new AbortController().signal;
-	return fetchConsoleProjection(server, credential.access, orgID, options.fetch ?? globalThis.fetch, signal);
+	return fetchConsoleProjection(
+		server,
+		credential.access,
+		orgID,
+		options.fetch ?? globalThis.fetch,
+		signal,
+		options.provider,
+	);
 }
 
 /**
  * Whether a stored projection should be re-read from `/api/config`: absent, or
  * last checked at/before `now - ttlMs` (or with no recorded `checkedAt`, which
  * covers credentials from before the field and pre-migration projections).
+ *
+ * `providerId` additionally invalidates a projection whose recorded
+ * {@link OpenCodeConsoleProjection.provider} does not match, and pre-`provider`
+ * projections (which may carry the sibling's endpoint/whitelist).
  */
 export function consoleProjectionStale(
 	credential: OpenCodeCredential | undefined,
 	now: number,
 	ttlMs: number = CONSOLE_PROJECTION_TTL_MS,
+	providerId?: string,
 ): boolean {
-	const checkedAt = credential?.console?.checkedAt;
+	const projection = credential?.console;
+	const checkedAt = projection?.checkedAt;
 	if (typeof checkedAt !== "number" || !Number.isFinite(checkedAt)) return true;
+	// A projection captured from the sibling provider carries the wrong
+	// endpoint/whitelist; treat it as stale so it is re-read.
+	if (providerId && projection?.provider !== providerId) return true;
+	// Projections captured before model-definition retention cannot synthesize
+	// whitelist-only catalog entries; consider them stale so they migrate once.
+	if (projection && projection.models.length > 0 && !projection.definitions) return true;
 	return now - checkedAt >= ttlMs;
 }
 
@@ -622,6 +749,25 @@ function canonicalModelRoutes(
 	return canonical;
 }
 
+function canonicalDefinitions(
+	definitions: Record<string, OpenCodeConsoleModelDefinition> | undefined,
+): Record<string, OpenCodeConsoleModelDefinition> | null {
+	if (!definitions) return null;
+	const canonical: Record<string, OpenCodeConsoleModelDefinition> = {};
+	for (const id of Object.keys(definitions).sort()) {
+		const def = definitions[id];
+		canonical[id] = {
+			...(def.name ? { name: def.name } : {}),
+			reasoning: def.reasoning,
+			input: [...def.input],
+			cost: { ...def.cost },
+			contextWindow: def.contextWindow,
+			maxTokens: def.maxTokens,
+		};
+	}
+	return canonical;
+}
+
 /**
  * Canonical payload of a projection, excluding `checkedAt`. Key order in
  * `headers`/`modelRoutes` is not semantic, so it is normalized before the
@@ -630,11 +776,13 @@ function canonicalModelRoutes(
 function consoleProjectionPayload(projection: OpenCodeConsoleProjection | undefined): string {
 	if (!projection) return "";
 	return JSON.stringify({
+		provider: projection.provider ?? null,
 		apiUrl: projection.apiUrl,
 		headers: sortedStringRecord(projection.headers),
 		models: [...projection.models],
 		api: projection.api ?? null,
 		modelRoutes: canonicalModelRoutes(projection.modelRoutes),
+		definitions: canonicalDefinitions(projection.definitions),
 	});
 }
 
@@ -677,23 +825,45 @@ export function mergeConsoleProjection(
  * (e.g. `muse-spark`, `provider.npm = "@ai-sdk/openai"`) only answer on the
  * Responses endpoint. Models outside the account whitelist are hidden
  * (OpenCode's merged config only contains the entitled models).
+ *
+ * Pi's built-in catalog lags the console, so a newly entitled model can be in
+ * the whitelist before `pi.dev` ships it. Those ids are synthesized from the
+ * projection's {@link OpenCodeConsoleModelDefinition}s and appended, so an
+ * entitlement surfaces without waiting for an upstream catalog update (the
+ * previous filter-only projection dropped them). `providerId` labels the
+ * synthesized entries; it defaults to the catalog's own provider.
  */
-export function projectConsoleModels(models: Model<Api>[], credential: OpenCodeCredential): Model<Api>[] {
+export function projectConsoleModels(
+	models: Model<Api>[],
+	credential: OpenCodeCredential,
+	providerId?: string,
+): Model<Api>[] {
 	const projection = credential.console;
-	const apiUrl = projection?.apiUrl ?? OPENCODE_INFERENCE_BASE_URL;
-	const defaultApi: Api = projection?.api ?? "openai-completions";
+	const provider = providerId ?? models[0]?.provider;
+	// Zen and Go share one console account but not one projection: each is a
+	// separate `provider` entry with its own `api` and whitelist. A projection
+	// captured for the sibling would route to the wrong endpoint and drop this
+	// provider's entitlements, so ignore it; `consoleProjectionStale` schedules a
+	// re-read for the correct entry.
+	const mismatched =
+		provider !== undefined && projection?.provider !== undefined && projection.provider !== provider;
+	const active = mismatched ? undefined : projection;
+	const fallbackApiUrl =
+		provider === OPENCODE_GO_PROVIDER ? OPENCODE_GO_INFERENCE_BASE_URL : OPENCODE_INFERENCE_BASE_URL;
+	const apiUrl = active?.apiUrl ?? fallbackApiUrl;
+	const defaultApi: Api = active?.api ?? "openai-completions";
 	const orgID = typeof credential.orgID === "string" && credential.orgID ? credential.orgID : undefined;
-	const headers: Record<string, string> = { ...projection?.headers };
+	const headers: Record<string, string> = { ...active?.headers };
 	// The remote config already carries the header; derive it from orgID for
 	// credentials logged in before the projection was captured.
 	if (orgID && !Object.keys(headers).some((key) => key.toLowerCase() === OPENCODE_ORG_HEADER)) {
 		headers[OPENCODE_ORG_HEADER] = orgID;
 	}
-	const allowed = projection?.models && projection.models.length > 0 ? new Set(projection.models) : undefined;
-	return models
+	const allowed = active?.models && active.models.length > 0 ? new Set(active.models) : undefined;
+	const projected: Model<Api>[] = models
 		.filter((model) => !allowed || allowed.has(model.id))
 		.map((model) => {
-			const route = projection?.modelRoutes?.[model.id];
+			const route = active?.modelRoutes?.[model.id];
 			return {
 				...model,
 				api: route?.api ?? defaultApi,
@@ -701,6 +871,30 @@ export function projectConsoleModels(models: Model<Api>[], credential: OpenCodeC
 				headers: { ...(model.headers ?? {}), ...headers },
 			};
 		});
+
+	if (allowed && provider && active?.definitions) {
+		const present = new Set(projected.map((model) => model.id));
+		for (const id of active.models) {
+			if (present.has(id)) continue;
+			const definition = active.definitions[id];
+			if (!definition) continue;
+			const route = active.modelRoutes?.[id];
+			projected.push({
+				id,
+				name: definition.name ?? id,
+				api: route?.api ?? defaultApi,
+				provider,
+				baseUrl: route?.apiUrl ?? apiUrl,
+				reasoning: definition.reasoning,
+				input: [...definition.input],
+				cost: { ...definition.cost },
+				contextWindow: definition.contextWindow,
+				maxTokens: definition.maxTokens,
+				headers: { ...headers },
+			});
+		}
+	}
+	return projected;
 }
 
 async function refreshToken(
@@ -757,11 +951,24 @@ async function login(
 	provider: string,
 	readSibling?: () => OpenCodeCredential | undefined,
 ): Promise<OpenCodeCredential> {
-	// `opencode-go` is the same console account as `opencode`: reuse a stored
-	// Zen credential instead of asking the user to authorize a second time.
+	// `opencode-go` is the same console account as `opencode`: reuse the stored
+	// Zen credential (same token/identity) instead of asking for a second
+	// consent. The projection is *not* shared: Go has its own inference endpoint
+	// and whitelist, so re-read it from Go's `/api/config` entry.
 	if (provider === OPENCODE_GO_PROVIDER) {
 		const adopted = readSiblingCredential(readSibling);
-		if (adopted) return { ...adopted, server: adopted.server ?? server };
+		if (adopted) {
+			const target: OpenCodeCredential = { ...adopted, server: adopted.server ?? server };
+			const signal = callbacks.signal ?? new AbortController().signal;
+			const orgID = typeof target.orgID === "string" && target.orgID ? target.orgID : undefined;
+			const projection = await fetchConsoleProjection(server, target.access, orgID, fetchImpl, signal, provider);
+			if (projection) return { ...target, console: projection };
+			// Off-network: drop the sibling's projection rather than route Go
+			// through Zen's endpoint/whitelist; the startup refresh refills it.
+			const withoutProjection = { ...target };
+			delete withoutProjection.console;
+			return withoutProjection;
+		}
 	}
 
 	const signal = callbacks.signal ?? new AbortController().signal;
@@ -782,7 +989,7 @@ async function login(
 	});
 	const token = await pollForToken(server, device, fetchImpl, signal);
 	const identity = await fetchUserOrgs(server, token.access, fetchImpl, signal);
-	const projection = await fetchConsoleProjection(server, token.access, identity.orgID, fetchImpl, signal);
+	const projection = await fetchConsoleProjection(server, token.access, identity.orgID, fetchImpl, signal, provider);
 	return {
 		access: token.access,
 		refresh: token.refresh,
@@ -820,7 +1027,7 @@ export function createOpencodeOAuth(
 			return credentials.access;
 		},
 		modifyModels(models, credentials) {
-			return projectConsoleModels(models as Model<Api>[], credentials as OpenCodeCredential);
+			return projectConsoleModels(models as Model<Api>[], credentials as OpenCodeCredential, provider);
 		},
 	};
 }
