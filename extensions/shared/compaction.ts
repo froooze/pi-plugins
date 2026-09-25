@@ -11,7 +11,8 @@
 
 /**
  * Operative auto-compact threshold (tokens) for the listed 1M-window models
- * (muse-spark, glm, deepseek V4) in `compact-per-model.ts`. Must stay strictly
+ * (muse-spark, glm, deepseek V4, Space Bunny Free) in
+ * `compact-per-model.ts`. Must stay strictly
  * below `COMPACT_BACKSTOP_TOKENS` so per-model timing always wins and blackhole
  * only fires as the safety net.
  *

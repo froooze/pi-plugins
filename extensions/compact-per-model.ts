@@ -15,8 +15,8 @@
  * 300k is blackhole's global backstop (set in the global config by
  * `blackhole-defaults.ts`; a project-local config or `PI_BLACKHOLE_*` env var
  * can shadow it). This extension sets the operative policy *below* it: 295k
- * for the listed 1M-window models (muse-spark, glm, deepseek V4), 249k as the
- * fallback default for unlisted models, 230k for luna
+ * for the listed 1M-window models (muse-spark, glm, deepseek V4, Space Bunny
+ * Free), 249k as the fallback default for unlisted models, 230k for luna
  * (~85% of its 272k window), 165k for mimo-v2.6-flash-free (82.5% of its
  * 200k window — the fallback would sit above that window itself). Every
  * per-model value is strictly under the 300k backstop, so per-model timing
@@ -37,6 +37,7 @@
  *   "notify": true,
  *   "models": {
  *     "opencode/muse-spark-1.3-contributor-free": 295000,
+ *     "opencode/space-bunny-free": 295000,
  *     "openai-codex/gpt-5.6-luna": 230000,
  *     "opencode/mimo-v2.6-flash-free": 165000,
  *     "opencode-go/deepseek-v4.1-flash": 295000
@@ -92,6 +93,7 @@ const DEFAULTS: Config = {
 		"opencode/muse-spark-1.3": COMPACT_PER_MODEL_1M,
 		"opencode/muse-spark-1.2-contributor-free": COMPACT_PER_MODEL_1M,
 		"opencode/muse-spark-1.2": COMPACT_PER_MODEL_1M,
+		"opencode/space-bunny-free": COMPACT_PER_MODEL_1M,
 		"opencode-go/glm-5.3-flash": COMPACT_PER_MODEL_1M,
 		"opencode/glm-5.3-flash": COMPACT_PER_MODEL_1M,
 		"opencode-go/deepseek-v4.1-flash": COMPACT_PER_MODEL_1M,
