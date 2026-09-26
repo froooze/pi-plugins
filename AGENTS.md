@@ -20,6 +20,8 @@ A bump touches **four** places — miss one and docs/installs drift:
 
 `test/pins.test.ts` enforces 1/3/4 against 2. Run it via `npm run test:pins` (part of `npm test`); it fails loudly on a stale README hash, a repo mismatch, or an `allowScripts` version mismatch. Never hand-edit only `package.json`: after any bump, run `npm test` before pushing.
 
+`/pi-upgrade` separately queries each fork's branch head and advances the *installed* checkout's pins directly (`extensions/shared/bundle-pins.ts`), because `pi update --extensions` installs only the pinned commit. That keeps a machine current between repo bumps; the four places above remain the source of truth for other machines.
+
 ### Fork splits
 
 `@ff-labs/pi-fff` and `pi-blackhole` live in their own repos. `@juicesharp/rpiv-todo`
