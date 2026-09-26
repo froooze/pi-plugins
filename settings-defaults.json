@@ -17,6 +17,7 @@
       },
       "enforce": {
         "memory": false,
+        "statusBar": false,
         "compactAfterTokens": 300000,
         "retainedToolOutputMaxTokens": 29500,
         "tailBehavior": "pi-default"

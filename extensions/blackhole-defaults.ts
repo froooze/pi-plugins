@@ -41,6 +41,15 @@ const ENFORCED_ENV_VARS: Record<
 			return undefined;
 		},
 	},
+	statusBar: {
+		var: "PI_BLACKHOLE_STATUSBAR",
+		parse: (raw) => {
+			const v = raw.trim().toLowerCase();
+			if (["1", "true", "yes", "on"].includes(v)) return true;
+			if (["0", "false", "no", "off"].includes(v)) return false;
+			return undefined;
+		},
+	},
 	compactAfterTokens: {
 		var: "PI_BLACKHOLE_COMPACT_AFTER_TOKENS",
 		parse: (raw) => {

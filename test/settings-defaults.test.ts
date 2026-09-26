@@ -183,6 +183,7 @@ test("settings-defaults.json agrees with the code constants for every target", (
 		RETAINED_TOOL_OUTPUT_MAX_TOKENS,
 	);
 	assert.equal(targets["pi-blackhole"]?.enforce?.memory, false);
+	assert.equal(targets["pi-blackhole"]?.enforce?.statusBar, false);
 	assert.equal(targets["pi-blackhole"]?.enforce?.tailBehavior, "pi-default");
 
 	// pi-fff
