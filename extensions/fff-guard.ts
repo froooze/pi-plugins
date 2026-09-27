@@ -17,6 +17,21 @@
  * cwd itself is `/` or `$HOME`, where FFF tools fail fast instead of
  * indexing — the fix is to `cd` into the project and run pi there.
  *
+ * That fail-fast surfaces twice, and the second one is pure noise: pi-fff
+ * catches the thrown picker error and re-reports it as
+ * `ctx.ui.notify("FFF init failed: …", "error")` (index.ts:
+ * reportInitFailure), on `session_start` and again from its
+ * `before_agent_start` fallback. There is no pi event hook for
+ * notifications, so the only interception point is the shared `ctx.ui`
+ * object itself. fff-guard loads before pi-fff (the `./extensions` entry
+ * precedes the pi-fff entry in this package's `pi.extensions` manifest) and
+ * runner.emit() walks extensions in load order, so wrapping `notify` in our
+ * own `session_start` is in place before pi-fff's handler reaches the same
+ * event. The wrapper drops ONLY the known root/home refusal — an FFF init
+ * failure with any other cause (corrupt frecency DB, bad native binding) is
+ * a real fault and still reaches the user. Set `PI_FFF_GUARD_STRICT=1` to
+ * keep the raw error as well.
+ *
  * Finally, a `tool_result` hook catches FFF's fail-fast refusal
  * (`Failed to create FFF file picker ... Refusing to index ...`) and
  * appends a retry hint pointing the model at `bash` with `rg`/`fd`
@@ -50,6 +65,87 @@ const FFF_TOOL_NAMES = new Set([
 ]);
 
 const REFUSAL_RE = /Refusing to index|Failed to create FFF file picker/i;
+
+// pi-fff's own re-report of the refusal: `FFF init failed: Failed to create
+// FFF file picker for <cwd>: Failed to init file picker: Can not run certain
+// FFF features in a file system root or home directories. …` (or the older
+// `Refusing to index` / `too large` wordings). Anchored on the prefix so a
+// grep result that merely quotes FFF cannot be mistaken for a notification.
+const INIT_FAILURE_RE = /^FFF init failed:/;
+
+// The refusal wording inside it. Every branch means "cwd is `/` or `$HOME`
+// and scanning it is disabled" — i.e. exactly the case we already reported
+// ourselves in `session_start`, so the red duplicate adds nothing.
+const ROOT_HOME_REFUSAL_RE =
+	/file system root or home director|Refusing to index|is too large/i;
+
+/** Minimal shape of the shared `ctx.ui` we wrap. */
+export type NotifyCapableUi = {
+	notify: (message: string, type?: "info" | "warning" | "error") => void;
+};
+
+/**
+ * Whether a pi-fff notification is the root/home refusal this extension
+ * already explains. Two independent gates: the message must be pi-fff's
+ * init-failure report (not some other extension's toast), and it must name
+ * the root/home refusal (not a genuine FFF fault).
+ */
+export function shouldSuppressInitFailure(message: string, cwd: string): boolean {
+	if (typeof message !== "string") return false;
+	if (!INIT_FAILURE_RE.test(message.trimStart())) return false;
+	if (!ROOT_HOME_REFUSAL_RE.test(message)) return false;
+	// Belt and braces: the refusal is only ever emitted for a root/home cwd,
+	// and only pi-fff's main-finder init reports it. Anything else (an aux
+	// picker for an absolute path, a DB problem) must stay visible.
+	return isFsRoot(cwd) || isHomeDir(cwd);
+}
+
+/** `PI_FFF_GUARD_STRICT=1` keeps the raw error next to our warning. */
+export function isStrict(env: NodeJS.ProcessEnv = process.env): boolean {
+	const raw = env.PI_FFF_GUARD_STRICT?.trim().toLowerCase();
+	return raw === "1" || raw === "on" || raw === "true";
+}
+
+// Restore handles of live filters, keyed by the wrapped ui object, so a
+// repeated `session_start` (new session, fork, switch) reuses one wrapper
+// instead of stacking a second one on top.
+const installed = new WeakMap<NotifyCapableUi, () => void>();
+
+/**
+ * Wrap `ui.notify` so the redundant FFF init-failure toast is dropped.
+ * Returns an idempotent restore function. Never throws: a UI object we
+ * cannot patch simply means the error stays visible, which is the old
+ * behavior and perfectly survivable.
+ */
+export function installInitFailureFilter(
+	ui: NotifyCapableUi,
+	opts: { cwd: string; strict?: boolean; env?: NodeJS.ProcessEnv },
+): () => void {
+	const noop = () => {};
+	try {
+		if (opts.strict ?? isStrict(opts.env)) return noop;
+		if (!ui || typeof ui.notify !== "function") return noop;
+		const existing = installed.get(ui);
+		if (existing) return existing;
+
+		const original = ui.notify;
+		const restore = () => {
+			if (ui.notify === filtered) ui.notify = original;
+			installed.delete(ui);
+		};
+		const filtered = function notify(this: unknown, message: string, type?: "info" | "warning" | "error") {
+			if (shouldSuppressInitFailure(message, opts.cwd)) return;
+			// Re-entering through the captured reference (not a bound copy) so
+			// restore() can hand back the exact original function object.
+			original.call(ui, message, type);
+		};
+		ui.notify = filtered;
+		installed.set(ui, restore);
+		return restore;
+	} catch {
+		return noop;
+	}
+}
 
 function toolResultText(content: Array<{ type: string; text?: string }>): string {
 	return content
@@ -107,6 +203,9 @@ function refusalHint(toolName: string, input: Record<string, unknown>, cwd?: str
 }
 
 export default function fffGuard(pi: ExtensionAPI) {
+	/** Undoes this session's `notify` wrap, if any. */
+	let restoreNotify: (() => void) | undefined;
+
 	// Fail-fast refusal -> self-correcting retry hint. Partial patch:
 	// only `content` is returned, `details`/`isError`/`usage` pass through.
 	// The isError gate matters: pi-fff's refusal is a thrown execute()
@@ -149,13 +248,39 @@ export default function fffGuard(pi: ExtensionAPI) {
 		// user the actual fix instead of leaving them with a raw init error.
 		try {
 			if (isFsRoot(ctx.cwd) || isHomeDir(ctx.cwd)) {
+				// pi-fff turns that same refusal into an `error` toast right
+				// after this handler; it only repeats what we just said, so
+				// drop it and keep exactly one message. Installed here — not
+				// at import time — because ctx.ui is only bound by then, and
+				// before pi-fff's handler because extensions load in order.
+				const strict = isStrict();
+				restoreNotify = installInitFailureFilter(ctx.ui, { cwd: ctx.cwd, strict });
 				ctx.ui.notify(
-					`fff-guard: running from ${ctx.cwd} — FFF indexing of / and $HOME is disabled, so file search is limited here. cd into your project and run pi there for full results.`,
+					`fff-guard: running from ${ctx.cwd} — FFF indexing of / and $HOME is disabled, so file search is limited here. cd into your project and run pi there for full results.` +
+						(strict ? "" : " (pi-fff's duplicate init error is suppressed.)"),
 					"warning",
 				);
+			} else {
+				// Not a root/home cwd: a real FFF fault (corrupt DB, broken
+				// native binding) must stay visible, so drop the filter.
+				restoreNotify?.();
+				restoreNotify = undefined;
 			}
 		} catch {
 			// Non-fatal; ignore.
+		}
+	});
+
+	// Keep the patch scoped to a session: on `/reload` the runner (and with
+	// it the wrapped ui object) is rebuilt anyway, and a replacement session
+	// re-installs on its own `session_start`.
+	pi.on("session_shutdown", async () => {
+		try {
+			restoreNotify?.();
+		} catch {
+			// Non-fatal; ignore.
+		} finally {
+			restoreNotify = undefined;
 		}
 	});
 }
