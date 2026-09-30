@@ -2,7 +2,8 @@
   "targets": {
     "settings": {
       "backfill": {
-        "retry.maxRetries": 6
+        "retry.maxRetries": 6,
+        "defaultTools": ["+codemode"]
       },
       "enforce": {
         "compaction.keepRecentTokens": 60000,

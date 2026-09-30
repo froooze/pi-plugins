@@ -170,6 +170,8 @@ test("settings-defaults.json agrees with the code constants for every target", (
 
 	// Pi settings.json
 	assert.equal(targets.settings?.backfill?.["retry.maxRetries"], 6);
+	// Additive form: a local defaultTools array wins wholesale, so this stays a backfill.
+	assert.deepEqual(targets.settings?.backfill?.defaultTools, ["+codemode"]);
 	assert.equal(targets.settings?.enforce?.["compaction.keepRecentTokens"], KEEP_RECENT_TOKENS);
 	assert.equal(targets.settings?.enforce?.tuiMode, "fullscreen");
 	assert.equal(targets.settings?.enforce?.theme, "dark-white-footer");

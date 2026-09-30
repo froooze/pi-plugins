@@ -16,10 +16,12 @@
  * non-settings behavior (shadow warnings, refusal hints).
  *
  * Pi caches `settings.json` in memory at startup, so writes apply to the next
- * session (`/reload` or restart). `pi-fff` snapshots its config at extension
- * load, so the `pi-fff` target is also applied eagerly at import, before the
- * bundled pi-fff extension loads. Malformed local values and corrupt files are
- * never clobbered; they are reported instead.
+ * session (`/reload` or restart). Since pi 0.99.2 `/reload` also activates tools
+ * newly added to the `defaultTools` setting, so the `+codemode` backfill takes
+ * effect there instead of waiting for a restart. `pi-fff` snapshots its config at
+ * extension load, so the `pi-fff` target is also applied eagerly at import,
+ * before the bundled pi-fff extension loads. Malformed local values and corrupt
+ * files are never clobbered; they are reported instead.
  *
  * Command: `/settings-defaults` shows every target and its effective values.
  */
