@@ -1,6 +1,6 @@
 ---
 name: ketch
-description: "Research skill for ketch — a fast stateless CLI for web search, OSS code search, curated library docs, page scraping, and site crawling; an optional MCP server exists for operators who want it, but the CLI is the primary interface. Use when a question needs live sources: 'research X', 'what are people saying about Y', 'find docs or real-world examples for Z', 'scrape/crawl this site' — or when installing or configuring ketch backends. Routes search vs code vs docs vs scrape vs crawl, keeps every fetch inside a token budget, turns error prefixes into control flow, and produces cited syntheses. Not for local codebase search, private repos, or pages behind auth."
+description: "Research skill for ketch — a fast stateless CLI for web search, OSS code search, curated library docs, page scraping, and site crawling; an optional MCP server exists for operators who want it (pi can wire it with `pi mcp add ketch -- ketch mcp serve`), but the CLI is the default and primary interface. Use when a question needs live sources: 'research X', 'what are people saying about Y', 'find docs or real-world examples for Z', 'scrape/crawl this site' — or when installing or configuring ketch backends. Routes search vs code vs docs vs scrape vs crawl, keeps every fetch inside a token budget, turns error prefixes into control flow, and produces cited syntheses. Not for local codebase search, private repos, or pages behind auth."
 version: 0.1.0
 license: MIT
 metadata:
@@ -15,9 +15,22 @@ Route every live-source question to one of ketch's five research surfaces — se
 
 This copy is bundled by `pi-plugins` for the pi agent and adapted as follows:
 
-- **Transport in pi is always the CLI.** Pi has no MCP client, so MCP tools
-  never appear in your tool list — step 2 of the transport decision resolves to
-  the CLI immediately. Never wait for MCP tools.
+- **Transport in pi is the CLI, unless the operator wired the MCP server.**
+  Pi has a built-in MCP client: `pi mcp add ketch --description "ketch: …" --
+  ketch mcp serve` (global `mcp.json`; `-l` for a trusted project), `pi mcp list`
+  to check it, `/reload` to connect. The default `codemode` exposure means the
+  six tools are reachable only from `codemode` scripts, never as `mcp__ketch__*`
+  in the tool list; the sign that ketch is wired is a `mcp__ketch` line in the
+  `mcp_servers` system prompt section, or `pi mcp list`. `--exposure direct`
+  declares the tools instead. The first script call can block: the server
+  connects in the background and a script waits when it names the namespace.
+  The description's first line is what the section shows, so prefer passing it.
+  Details in Codemode transport below.
+- **The server is a session-lifetime child.** Pi spawns `ketch mcp serve` over
+  stdio and it stays up for the whole session, so it holds the single-process
+  page-cache lock that whole time: its own scrapes are cached, CLI scrapes run
+  cache-disabled, and `ketch cache clear` fails. Pick one transport for
+  research calls and stay in it; operator actions stay CLI either way.
 - **Operator commands exist in pi:** `/ketch` (status: version, active
   backend, `ketch doctor` summary) and `/ketch setup` (install without a Go
   toolchain — SHA-256-verified release download, Homebrew, or npm — plus
@@ -31,11 +44,37 @@ This copy is bundled by `pi-plugins` for the pi agent and adapted as follows:
   yet.
 - Vendored from `1broseidon/ketch` **v0.18.0** (MIT). Rule 6 below governs
   drift: the binary always wins.
-- **Local additions, not upstream yet** (verified live against the v0.18.0
-  binary, 2026-09-22): the two extraction-fidelity gotchas below, the
-  fetch-failure line in the error situations, the stale-`--help` note and the
-  crawl-link note in `references/surfaces.md`, and the network-posture sentence
-  in Scope. Declared here so an upstream diff of this file stays explainable.
+- **Local additions, not upstream yet** (all verified live 2026-09-22 against the
+  v0.18.0 binary, pi 0.99.2's `mcp`/`codemode` extensions, and a live
+  `ketch mcp serve`): the two extraction-fidelity gotchas, the fetch-failure line
+  in error situations, the stale-`--help` and crawl-link notes in
+  `references/surfaces.md`, the network-posture sentence in Scope, the pi MCP
+  bullets above, the Codemode transport section, and `references/codemode.md`.
+  Declared here so an upstream diff of this file stays explainable.
+
+## Codemode transport in pi
+
+With the MCP server wired, the six surfaces are called from a `codemode` script.
+Two worked scripts and the rest of the detail: `references/codemode.md`.
+
+- `tools.mcp__ketch__<surface>({ … })`. ketch's own routing and error-prefix
+  instructions come from `describeNamespace("mcp__ketch")` — they are not in the
+  codemode description any more; `searchTools(…, { namespace })` and `ALL_TOOLS`
+  re-list the tools.
+- Read `structuredContent`, not `content[0].text`: all six tools declare an
+  `outputSchema`, and pi types the value `CallToolResult<T>`. `search`/`scrape` →
+  `{ warnings, results: [...] }`, `tag` → `{ tag, entries, shown, … }`.
+- `isError: true` resolves rather than throwing; a batch `scrape` reports
+  per-URL failures as `results[].error` inside a successful call.
+- Two budgets: `max_chars`/`trim` still bound each fetch (discipline 2 is
+  unchanged), while the context cost is only what the script emits — set
+  `// @options: {"max_output_tokens": 2000}`, then `text()`/`return` just the
+  passages the answer cites. Fan out with `Promise.all`, `store()` the working
+  set, and triage with `models.classify` when a classifier model exists (check
+  `stopReason === "stop"`, never truthiness).
+
+Prefer a direct tool call when exposure is `direct` and one small result answers
+the question. Operator actions remain CLI — see Gotchas.
 
 ## Transport: stateless CLI by default, MCP when the operator wired it
 
@@ -44,8 +83,8 @@ The CLI is ketch's identity: call → result → exit, `--json` on every call, e
 Decide once per session, before the first call:
 
 1. `which ketch` succeeds → the CLI is your transport: `--json` on every call, exit codes as control flow.
-2. Also check for ketch's MCP tools in your tool list — `search`, `code`, `docs`, `scrape`, `crawl` and `tag` from a server named `ketch` (in Claude Code: `mcp__ketch__search`, …). Present → the operator wired them up on purpose, and using them for research calls is correct and good: structured output, per-URL errors, no shell round-trip. Do not shell out around tools the operator set up.
-3. Both live → either transport serves research calls, but know the tradeoff: a running MCP server holds the single-process page-cache lock, so concurrent CLI scrapes silently run cache-disabled.
+2. Also check for ketch's MCP tools — `search`, `code`, `docs`, `scrape`, `crawl` and `tag` from a server named `ketch`. Under `direct` exposure they are in your tool list as `mcp__ketch__search`, …; under the default `codemode` exposure they are not, and the sign is a `mcp__ketch` line in the `mcp_servers` system prompt section (`pi mcp list` confirms it from the shell). Present → the operator wired them up on purpose, and using them is correct and good: structured output, per-URL errors, no shell round-trip. Do not shell out around tools the operator set up.
+3. Both live → either transport serves research calls, but a running MCP server holds the single-process page-cache lock, so CLI scrapes silently run cache-disabled. In pi that lock lasts the whole session, so mixing transports costs cache warmth for the rest of it.
 4. Neither CLI nor MCP tools → ketch is not installed. In pi, run `/ketch setup` (verified release download, no Go toolchain required). Otherwise offer `brew install ketch` or `go install github.com/1broseidon/ketch@latest` — an operator action: propose, wait for confirmation.
 
 The rule: **use the transport the operator gave you** — when both are live, either is fine for research calls, and operator actions are always CLI.
@@ -80,7 +119,7 @@ One question = one plan. Escalate a default run into `ketch research` when the f
 
 ## Non-negotiable disciplines
 
-1. **Use the transport the operator gave you.** The CLI is the default; MCP tools in your list mean the operator opted in — use them for research rather than shelling out around them. When both are live, either serves research calls (a running MCP server holds the page-cache lock, so concurrent CLI scrapes run uncached); operator actions — config, cache, browser, background crawls, doctor — are always CLI.
+1. **Use the transport the operator gave you.** The CLI is the default; MCP tools in your list — or a `mcp__ketch` line in the `mcp_servers` section, or its tools reachable from a codemode script — mean the operator opted in — use them for research rather than shelling out around them. When both are live, either serves research calls, but stay on one for research: a running MCP server holds the page-cache lock for its whole lifetime (in pi: the session), so CLI scrapes then run uncached and `ketch cache clear` fails; operator actions — config, cache, browser, background crawls, doctor — are always CLI.
 2. **Bound every fetch.** `max_chars` 4000–8000 plus `trim` on any scrape of a page you have not seen — an unguarded page can cost ~25k tokens. Skipping the cap requires a stated one-line reason ("known ~200-word page").
 3. **Cite every claim.** A research synthesis without source URLs is not a deliverable.
 4. **Error prefixes are control flow.** Classify before reacting. Never retry `[validation]` or `[not_found]` unchanged.
@@ -195,7 +234,7 @@ Detail for each lives in `references/surfaces.md`.
 - Batch scrape reports per-URL failures inside a successful call: `isError=false` with `results[].error` set. Check every entry.
 - `regexp` works on grepapp and sourcegraph only; github rejects it with a pointer to those backends.
 - Background crawls (`--background`, `status`, `stop`) are CLI-only; the MCP `crawl` is synchronous and capped.
-- The page cache (bbolt, 72h default TTL) is single-process: a long-running MCP server holds the lock, so concurrent CLI scrapes silently run cache-disabled — `ketch doctor` reports the cache as locked by another process. Running the server degrades the CLI; prefer CLI-only when both would run long-term.
+- The page cache (bbolt, 72h default TTL) is single-process: a live MCP server holds the lock for its whole lifetime — in pi, the whole session. CLI scrapes then run cache-disabled, `ketch cache clear` fails with `cannot open cache (may be in use by another process)`, and `ketch doctor` reports the cache as `locked by another process` with status still `ok`, so `/ketch` does not flag it. The server's own scrapes are cached normally. Clear the cache from a shell with no session running.
 - **Markdown extraction is lossy; `raw` is the fidelity path.** `<placeholder>` tokens vanish (`config set <provider>_api_key` → `config set \_api\_key`), every `_` is backslash-escaped, `text/plain` bodies collapse to one line, and XML sitemaps fabricate URLs. Treat commands copied out of scraped output as suspect: confirm them against `--help` or the `raw` bytes before running.
 - **crawl BFS discovers pages from links in extracted markdown**, and extraction strips site chrome — a page linked only from nav/footer is invisible at any `--depth`; enumerate generated sites with `--sitemap`.
 
@@ -204,8 +243,8 @@ Detail for each lives in `references/surfaces.md`.
 **BAD:** `scrape {url: "https://docs.example.com"}` — no bound; you get llms.txt or ~25k tokens, whichever is worse.
 **GOOD:** `scrape {url: "https://docs.example.com/quickstart", max_chars: 6000, trim: true}` — plus `no_llms_txt: true` when you want the page itself, not the site's llms.txt.
 
-**BAD:** Telling a user they must run an MCP server to use ketch with agents — the CLI plus a prompt block is the zero-infrastructure path, and a long-running server holds the page-cache lock against every CLI call.
-**GOOD:** CLI by default; MCP when the operator wired it — and when `mcp__ketch__*` tools are in your list, use them for research instead of shelling out around the operator's setup.
+**BAD:** In pi, `mcp__ketch` sits in the `mcp_servers` section and you still shell out to `ketch scrape` once per URL, dumping every page into the context.
+**GOOD:** One codemode script fans out `tools.mcp__ketch__search(...)` and `tools.mcp__ketch__scrape({ urls, max_chars, trim })`, reads the full `CallToolResult` in JS, and `text()`s only the passages the answer cites.
 
 **BAD:** `[upstream] ddg rate limited` → retry the identical call three times.
 **GOOD:** Rotate — `backend: "brave"` (or another provider from `available_backends`; `auto` is a chain, not a rotation target) — retry once, and note the swap. When `auto` itself failed, it already tried every usable provider: retry once, then report the outage.
@@ -218,6 +257,8 @@ Detail for each lives in `references/surfaces.md`.
 - `ketch research …` → read `references/verbs/ketch-research.md` before starting.
 - `ketch setup`, any `[precondition]`/exit 5, or an install → read `references/verbs/setup.md`.
 - Full flag/param tables, CLI↔MCP name mapping, backend/key matrix, or a surface behaving oddly → read `references/surfaces.md`.
+- Calling ketch from a `codemode` script, reading a result envelope, filtering
+  before output, or triaging with a classifier model → read `references/codemode.md`.
 
 ## Scope
 

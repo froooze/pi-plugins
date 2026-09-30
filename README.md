@@ -31,7 +31,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | Dir | What |
 |-----|------|
 | `extensions/` | TypeScript extensions (`.ts`, auto-discovered) — see own extensions below |
-| `skills/` | Agent skills (`*/SKILL.md`) — bundled: `ketch` research playbook (vendored from `1broseidon/ketch` v0.18.0, MIT, `skills/ketch/LICENSE`) |
+| `skills/` | Agent skills (`*/SKILL.md`) — bundled: `ketch` research playbook (vendored from `1broseidon/ketch` v0.18.0, MIT, `skills/ketch/LICENSE`). Five surfaces over the CLI or, when wired with `pi mcp add ketch -- ketch mcp serve`, over MCP through pi's `codemode` (`skills/ketch/references/codemode.md`: read `structuredContent`, filter in JS, triage with a classifier model) |
 | `prompts/` | Prompt templates (`.md`) |
 | `themes/` | TUI themes (`.json`) — currently `dark-white-footer` |
 
@@ -54,7 +54,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | `opencode-session-id` | Fills Pi's session id into extension-initiated one-shot completions so OpenCode/Go get the `x-opencode-session` routing header (e.g. custom compaction/handoff calls that bypass the main agent's `streamFn`); `PI_OPENCODE_ZEN_SPOOF=1` opt-in also spoofs Zen with the same full identity headers (UA + `ses_…`/`msg_…` ids + `x-opencode-project`) and the gate tools with `toolChoice:none`, following `opencode-client-spoof`'s `PI_OPENCODE_SPOOF_SCOPE` |
 | `pi-upgrade` | `/pi-upgrade [--check\|--offline\|--force\|--no-extensions\|--no-pins\|--no-models]` updates everything in one pass: syncs and rebuilds the local `froooze/pi` source checkout (fetch-and-count, fail-open dep install, post-build staleness guard), checks for and updates installed extensions (in-process `pi update --extensions`), advances the bundled-extension fork pins (`pi-blackhole`, `froooze/fff#pi-fff-only`, `froooze/rpiv-mono#rpiv-todo-only`) to their fork branch heads and reinstalls them (`pi update --extensions` installs only the exact pinned commit, so this keeps those forks current on a machine), and refreshes the agent model catalogs (in-process `pi update --models`). The pi checkout is optional — extensions, pins, and catalogs still update without it, and every build/install step honors the configured `npmCommand` (settings) instead of a hardcoded `npm`. `--check` reports pi/extension/pin drift (read-only), `--offline` skips the optional network halves (the pi fetch/pull still runs), and each half has a `--no-*` opt-out; checkout located via `PI_UPGRADE_REPO`, `<agentDir>/pi-upgrade.json`, or auto-derived from the running pi (no baked-in path) |
 | `prompt-slim` | Trims per-request system-prompt overhead: compacts pi's `<docs>` section and drops bundled tools' `promptGuidelines` bullets that merely restate their description/schema; `/prompt-slim` status, `PI_PROMPT_SLIM=off\|docs\|guidelines` |
-| `settings-defaults` | The single applier for every file-backed plugin default. Writes each target in `settings-defaults.json` through one function: Pi `settings.json` (`retry.maxRetries=6` backfill; `compaction.keepRecentTokens=60000`, `tuiMode`, `theme` enforce), `pi-blackhole/pi-blackhole-config.json` (engine/tail/backstop/retained-output/memory/status-bar-off), `pi-fff.json` (root/home scanning, env-mirrored). Applies after `/reload`; `/settings-defaults` status |
+| `settings-defaults` | The single applier for every file-backed plugin default. Writes each target in `settings-defaults.json` through one function: Pi `settings.json` (`retry.maxRetries=6` and `defaultTools=["+codemode"]` backfill — active after `/reload` as of pi 0.99.2; `compaction.keepRecentTokens=60000`, `tuiMode`, `theme` enforce), `pi-blackhole/pi-blackhole-config.json` (engine/tail/backstop/retained-output/memory/status-bar-off), `pi-fff.json` (root/home scanning, env-mirrored). Applies after `/reload`; `/settings-defaults` status |
 | `task-notify` | OS desktop notification when a run settles (`agent_settled`, post-retry/compaction): Linux `notify-send` → `gdbus` via the freedesktop D-Bus service (works on X11 **and** Wayland, incl. KDE Plasma/KWin, GNOME, XFCE, sway/dunst), macOS `osascript`, Windows PowerShell WinRT toast. `Aborted` runs stay silent; title is the session name (else project folder) and the body carries outcome + duration + source path (~-shortened); toasts linger ~5s. TUI-only; `PI_TASK_NOTIFY=off` / `PI_NOTIFICATIONS=off` opt-outs; `/notify [status\|test\|on\|off]` (`<agentDir>/task-notify.json`). Position/transparency/colors are daemon-owned, not settable via the API |
 | `todo-reconcile` | On `agent_settled`, if the `rpiv-todo` list still has open tasks, injects one follow-up telling the model to finish or reconcile them. TUI-only; aborts, exhausted errors, deferred ops, and headless/subagent/RPC sessions are skipped, one nudge per user turn (`<agentDir>/todo-reconcile.json`) |
 
@@ -106,7 +106,7 @@ Every plugin's file-backed defaults are centralized in `settings-defaults.json`,
 {
   "targets": {
     "settings": {
-      "backfill": { "retry.maxRetries": 6 },
+      "backfill": { "retry.maxRetries": 6, "defaultTools": ["+codemode"] },
       "enforce": {
         "compaction.keepRecentTokens": 60000,
         "tuiMode": "fullscreen",
@@ -134,9 +134,9 @@ Every plugin's file-backed defaults are centralized in `settings-defaults.json`,
 }
 ```
 
-`settings-defaults` applies each target at session start (Pi caches `settings.json` at startup, so writes apply after `/reload`):
+`settings-defaults` applies each target at session start (Pi caches `settings.json` at startup, so writes apply after `/reload`; since pi 0.99.2 `/reload` also activates tools newly added to `defaultTools`, so `+codemode` is live after a reload rather than a restart):
 
-- `backfill` — written only when the leaf is absent, so an explicit local value always wins;
+- `backfill` — written only when the leaf is absent, so an explicit local value always wins; a local `defaultTools` array therefore replaces ours wholesale rather than merging (`["+codemode"]` is pi's additive form: built-in `read`/`bash`/`edit`/`write` plus `codemode`, which pi otherwise auto-activates only when an MCP server is configured — the `ketch` skill's `references/codemode.md` is what uses it here);
 - `enforce` — written whenever the leaf differs, for values that must track the plugin;
 - `env` — mirrors a backfilled boolean to an env var (`true`/`false` → `"1"`/`"0"`) only when that var is unset; pi-fff snapshots its config at extension load, so its target is also applied eagerly at import.
 
