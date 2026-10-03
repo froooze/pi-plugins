@@ -10,8 +10,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+	buildEnvExports,
 	buildLauncherScript,
+	buildPiFlags,
 	deriveTitle,
+	detectCurrentTerminal,
 	findExecutable,
 	launchBtw,
 	normalizeQuestion,
@@ -60,18 +63,29 @@ test("shellQuote: single-quotes and escapes embedded quotes", () => {
 // buildLauncherScript
 // ---------------------------------------------------------------------------
 
-test("buildLauncherScript: absolute node/entry, PATH, fork, error pause, self-clean", () => {
+test("buildLauncherScript: absolute node/entry, env re-export, pause, self-clean", () => {
 	const script = buildLauncherScript({
 		node: "/usr/bin/node",
 		entry: "/opt/pi/cli.js",
 		cwd: "/tmp/my project",
-		path: "/nvm/bin:/usr/bin",
+		env: { PATH: "/nvm/bin:/usr/bin", GREETING: "it's here" },
+		piFlags: ["--provider", "anthropic", "--model", "claude-x", "--thinking", "high"],
 	});
-	assert.match(script, /cd '\/tmp\/my project' \|\| exit 1/);
-	assert.match(script, /export PATH='\/nvm\/bin:\/usr\/bin':"\$PATH"/);
-	assert.match(script, /'\/usr\/bin\/node' '\/opt\/pi\/cli\.js' --fork "\$1" -- "\$\(cat "\$2"\)"/);
-	assert.match(script, /read -r _ \|\| true/);
+	assert.ok(script.includes("export PATH='/nvm/bin:/usr/bin'"));
+	assert.ok(script.includes("export GREETING='it'\\''s here'"));
+	assert.match(script, /pause\(\) \{/);
+	assert.match(script, /cd '\/tmp\/my project' \|\| \{ pause 'working directory not found: \/tmp\/my project'/);
+	assert.match(
+		script,
+		/'\/usr\/bin\/node' '\/opt\/pi\/cli\.js' --fork "\$1" '--provider' 'anthropic' '--model' 'claude-x' '--thinking' 'high' -- "\$\(cat "\$2"\)"/,
+	);
+	assert.match(script, /pause "pi exited with status \$status"/);
 	assert.match(script, /rm -rf -- "\$dir"/);
+});
+
+test("buildEnvExports: shell-quotes values and skips unsafe names", () => {
+	const out = buildEnvExports({ GOOD: "a b", "bad-name": "x", IFS: " ", MISSING: undefined } as NodeJS.ProcessEnv);
+	assert.equal(out, "export GOOD='a b'");
 });
 
 // ---------------------------------------------------------------------------
@@ -91,9 +105,14 @@ test("resolvePiLaunch: PI_BTW_PI entry wins; node is this process's executable",
 	}
 });
 
-test("resolvePiLaunch: falls back to this process's own entry", () => {
-	const pi = resolvePiLaunch({ PATH: "" });
-	assert.equal(pi?.entry, realpathSync(process.argv[1]!));
+test("resolvePiLaunch: skips a non-runnable TS self entry", () => {
+	const pi = resolvePiLaunch({ PATH: process.env.PATH });
+	const self = process.argv[1];
+	if (self && /\.(ts|tsx|mts|cts)$/i.test(self)) {
+		assert.notEqual(pi?.entry, realpathSync(self));
+	} else {
+		assert.equal(pi?.entry, realpathSync(self!));
+	}
 });
 
 // ---------------------------------------------------------------------------
@@ -110,6 +129,12 @@ test("findExecutable: finds on PATH and honours absolute paths", () => {
 		assert.equal(findExecutable("definitely-not-here", { PATH: dir }), undefined);
 		assert.equal(findExecutable(bin, { PATH: "" }), bin);
 		assert.equal(findExecutable(join(dir, "nope"), { PATH: "" }), undefined);
+
+		// Present but not executable: must not be selected.
+		const plain = join(dir, "not-executable");
+		writeFileSync(plain, "#!/bin/sh\n", "utf8");
+		assert.equal(findExecutable("not-executable", { PATH: dir }), undefined);
+		assert.equal(findExecutable(plain, { PATH: "" }), undefined);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -172,6 +197,21 @@ test("selectLauncher: macOS falls back to osascript", () => {
 	assert.equal(launcher?.id, "macos-terminal");
 });
 
+test("detectCurrentTerminal: reads emulator env markers", () => {
+	assert.equal(detectCurrentTerminal({ KITTY_WINDOW_ID: "1" }), "kitty");
+	assert.equal(detectCurrentTerminal({ TERM: "xterm-kitty" }), "kitty");
+	assert.equal(detectCurrentTerminal({ TERM_PROGRAM: "WezTerm" }), "wezterm");
+	assert.equal(detectCurrentTerminal({ TERM: "xterm-ghostty" }), "ghostty");
+	assert.equal(detectCurrentTerminal({ GNOME_TERMINAL_SERVICE: "x" }), "gnome-terminal");
+	assert.equal(detectCurrentTerminal({}), undefined);
+});
+
+test("selectLauncher: prefers the terminal we are running inside", () => {
+	const has = () => true; // xfce4-terminal and kitty both installed
+	assert.equal(selectLauncher({ KITTY_WINDOW_ID: "1" }, has)?.id, "kitty");
+	assert.equal(selectLauncher({}, has)?.id, "xfce4-terminal");
+});
+
 // ---------------------------------------------------------------------------
 // launchBtw
 // ---------------------------------------------------------------------------
@@ -184,7 +224,7 @@ function quotedParts(command: string): string[] {
 function fakeSpawn(calls: { command: string; args: string[] }[]) {
 	return ((command: string, args: string[]) => {
 		calls.push({ command, args });
-		return { on() {}, unref() {} } as never;
+		return { pid: 1234, on() {}, unref() {} } as never;
 	}) as never;
 }
 
@@ -207,6 +247,31 @@ test("launchBtw: empty question is rejected before any launch", () => {
 	assert.equal(calls.length, 0);
 });
 
+test("launchBtw: reports a failed spawn instead of claiming success", () => {
+	const calls: { command: string; args: string[] }[] = [];
+	const outcome = launchBtw({
+		sessionFile: "/sessions/copy.jsonl",
+		question: "hi",
+		cwd: "/tmp/project",
+		env: { PI_BTW_LAUNCH: "myterm {cmd}", PATH: process.env.PATH },
+		spawnImpl: ((command: string, args: string[]) => {
+			calls.push({ command, args });
+			return { pid: undefined, on() {}, unref() {} } as never;
+		}) as never,
+	});
+	assert.equal(outcome.ok, false);
+	if (!outcome.ok) assert.match(outcome.error, /could not start/);
+	assert.equal(calls.length, 1);
+});
+
+test("buildPiFlags: pins provider/model and thinking", () => {
+	assert.deepEqual(
+		buildPiFlags({ model: { provider: "anthropic", id: "claude-x" }, thinkingLevel: "high" } as never),
+		["--provider", "anthropic", "--model", "claude-x", "--thinking", "high"],
+	);
+	assert.deepEqual(buildPiFlags({ model: undefined, thinkingLevel: undefined } as never), []);
+});
+
 test("launchBtw: writes a multi-line question and spawns the configured terminal", () => {
 	const calls: { command: string; args: string[] }[] = [];
 	const question = "line 1\n\n  indented line 2\nline 3";
@@ -214,7 +279,7 @@ test("launchBtw: writes a multi-line question and spawns the configured terminal
 		sessionFile: "/sessions/copy.jsonl",
 		question,
 		cwd: "/tmp/project",
-		env: { PI_BTW_LAUNCH: "myterm --flag {cmd}" },
+		env: { PI_BTW_LAUNCH: "myterm --flag {cmd}", PATH: process.env.PATH },
 		spawnImpl: fakeSpawn(calls),
 	});
 	assert.equal(outcome.ok, true);

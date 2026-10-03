@@ -40,7 +40,7 @@ pi install git:github.com/froooze/pi-plugins@v1
 | Extension | What it does |
 |-----------|--------------|
 | `blackhole-defaults` | Warns when a project-local pi-blackhole config, a `PI_BLACKHOLE_*` env var, a project `settings.json`, or a per-model `compaction.modelOverrides` entry shadows a value enforced by `settings-defaults` |
-| `btw` | `/btw [question]` opens a side question in a **forked copy of the current session, in a new terminal window** (`pi --fork …`). The fork keeps the whole transcript and streams real thinking/tools; the main session is untouched. `/btw` alone opens Pi's multi-line editor, so formatted questions work (newlines preserved). Terminal auto-detected (tmux, xfce4-terminal, kitty, wezterm, alacritty, ghostty, konsole, gnome-terminal, xterm, macOS Terminal); `PI_BTW_LAUNCH` overrides with a `{cmd}` template, `PI_BTW_PI` overrides the `pi` binary |
+| `btw` | `/btw [question]` opens a side question in a **forked copy of the current session, in a new terminal window** (`pi --fork …`). The fork is a point-in-time copy of the transcript, is pinned to the current provider/model/thinking level, and streams real thinking/tools; the main session is untouched. `/btw` alone opens Pi's multi-line editor, so formatted questions work (newlines preserved). Terminal auto-detected (tmux, the terminal you're running in, then xfce4-terminal, kitty, wezterm, alacritty, ghostty, konsole, gnome-terminal, x-terminal-emulator, xterm, macOS Terminal); the new window restores this process's environment, `PI_BTW_LAUNCH` overrides with a `{cmd}` template, `PI_BTW_PI` overrides the `pi` binary |
 | `colored-footer` | Per-stat colored footer; extension statuses (e.g. 🗜) render inline |
 | `compact-per-model` | Per-model auto-compact thresholds from `shared/compaction.ts`: 295k for the listed 1M-window models (muse-spark, glm, deepseek V4, Space Bunny Free), 249k fallback for unlisted models, 230k for luna (~85% of its 272k window), 165k for mimo-v2.6-flash-free (82.5% of its 200k window; the 249k fallback would sit above that window) — all below blackhole's 300k backstop on settled runs; blackhole stays the engine |
 | `fff-guard` | Confines FFF indexing to the project cwd (never `/`/`$HOME`; scanning flags declared in `settings-defaults.json`); warns when launched from `/`/`$HOME` and swallows pi-fff's duplicate `FFF init failed` toast for that same case (genuine FFF faults — corrupt DB, broken native binding — still surface; `PI_FFF_GUARD_STRICT=1` keeps the raw error), plus fail-fast `rg`/`fd` fallback hints |
@@ -77,7 +77,7 @@ Pick with two questions:
 - `/tree` — keep alternatives together in one session; switching branches can summarize the abandoned one.
 - `/fork` — go back to an earlier prompt and take a different path.
 - `/clone` — snapshot the current state and continue in the copy; the original stays as a record.
-- `/btw` — ask a side question against a full copy of the current context without disturbing the main session (see the `btw` row above for launcher details).
+- `/btw` — ask a side question against a point-in-time copy of the current context without disturbing the main session (see the `btw` row above for launcher details).
 
 ## 🧭 Model defaults
 

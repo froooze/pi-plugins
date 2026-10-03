@@ -17,6 +17,12 @@
  * transcript as context, streams its thinking/output, and can use tools — while
  * the *main* session is never touched (fork copies; it does not share the file).
  *
+ * The fork is a point-in-time copy of the session file as it exists on disk;
+ * messages added to the main session afterwards are not visible to the side
+ * window. The fork is also pinned to this session's provider/model and thinking
+ * level (`--provider/--model/--thinking`), so it never silently re-resolves a
+ * different default or fails auth in the new environment.
+ *
  * Two ways to ask
  * ---------------
  * - `/btw why is X slow?`      — single line, passed straight through.
@@ -27,16 +33,18 @@
  * ------------------------
  * A tiny launcher script is written to a temp dir. The script `cd`s to the
  * session cwd, runs the forked Pi (reading the question from a file, so no
- * shell-quoting of the question is ever needed), then deletes the temp dir.
+ * shell-quoting of the question is ever needed), then deletes the temp dir. A
+ * missing cwd or a non-zero Pi exit pauses with a message instead of closing
+ * the window silently.
  *
  * The script invokes Pi as `<node> <cli.js>` using absolute paths captured
- * from the running process, and exports this process's `PATH`. This is not
- * paranoia: terminal multiplexers/servers (xfce4-terminal, gnome-terminal)
- * spawn the command from a long-lived server whose environment predates the
- * user's shell, so `pi`/`node` are frequently not on its `PATH` and tools run
- * by the forked session would otherwise see a stripped `PATH`. The xfce
- * launcher additionally passes `--disable-server`, so its window inherits the
- * client environment directly.
+ * from the running process, and re-exports this process's **whole environment**
+ * (not just `PATH`). This is not paranoia: terminal multiplexers/servers
+ * (xfce4-terminal, gnome-terminal) spawn the command from a long-lived server
+ * whose environment predates the user's shell, so `pi`/`node` are frequently
+ * not on its `PATH`, and settings/auth carried in the environment would be
+ * stripped too. The xfce launcher additionally passes `--disable-server`, so
+ * its window inherits the client environment directly.
  *
  * A terminal is chosen from the environment, in order:
  *
@@ -44,18 +52,24 @@
  *      `PI_BTW_LAUNCH='kitty --title btw -e {cmd}'`); the rest is appended when
  *      `{cmd}` is absent. Use this for anything not auto-detected.
  *   2. tmux — `tmux new-window` when `$TMUX` is set.
- *   3. xfce4-terminal, kitty, wezterm, alacritty, ghostty, konsole,
+ *   3. the terminal we are running inside, detected from its env markers
+ *      (`KITTY_WINDOW_ID`, `WEZTERM_PANE`, `ALACRITTY_WINDOW_ID`,
+ *      `GHOSTTY_RESOURCES_DIR`, `KONSOLE_VERSION`, `TERM_PROGRAM`, …).
+ *   4. xfce4-terminal, kitty, wezterm, alacritty, ghostty, konsole,
  *      gnome-terminal, x-terminal-emulator, xterm.
- *   4. macOS: `osascript` driving Terminal.app.
+ *   5. macOS: `osascript` driving Terminal.app.
  *
- * `$PI_BTW_PI` overrides the `pi` executable to launch (default: `pi` on PATH).
+ * `$PI_BTW_PI` overrides the `pi` executable to launch (default: `pi` on PATH);
+ * a TypeScript self-entry is skipped because `node` cannot run it. Pi's JS entry
+ * is launched directly with absolute `node` (bypassing any shell wrapper), which
+ * the environment re-export above compensates for.
  *
  * Requirements: interactive TUI mode, a saved session file to fork, and one of
  * the launchers above. Everything is best-effort — a missing launcher or a
  * failed spawn surfaces as a `ctx.ui.notify`, never an unhandled throw.
  */
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -77,7 +91,7 @@ export const TEMP_PREFIX = "pi-btw-";
 export const MSG_REQUIRES_TUI = "/btw requires an interactive terminal";
 export const MSG_USAGE =
 	"Usage: /btw [question] — a single-line question, or run /btw alone to compose a multi-line one";
-export const MSG_NO_SESSION = "/btw needs a saved session to fork (this session is ephemeral)";
+export const MSG_NO_SESSION = "/btw needs a saved session with at least one message to fork (this session has none yet)";
 export const MSG_NO_PI =
 	`btw: could not resolve the pi executable to launch — set ${BTW_PI_ENV} to the pi entry script`;
 export const MSG_NO_TERMINAL = `btw: no terminal launcher found — set ${BTW_LAUNCH_ENV} (e.g. 'xfce4-terminal --window -x {cmd}')`;
@@ -105,26 +119,63 @@ export function shellQuote(value: string): string {
 }
 
 /**
- * The launcher script dropped into the temp dir. Reads the question from `$2`
- * (a file) so arbitrary multi-line text needs no quoting, runs Pi with absolute
- * `node`/entry paths plus the captured `PATH`, and removes its own temp dir
- * once Pi exits. A failed run pauses so the error is readable in the window.
+ * Shell variables the launcher must not re-export: positional/shell-internal
+ * values that would either be wrong in the new shell or break it.
  */
-export function buildLauncherScript(opts: { node: string; entry: string; cwd: string; path?: string }): string {
+const ENV_SKIP = new Set(["_", "PWD", "OLDPWD", "SHLVL", "IFS", "PS1", "PS2", "PS4", "BASH_ENV", "ENV"]);
+
+/** Render `export KEY='value'` lines for an environment (shell-quoted, safe names only). */
+export function buildEnvExports(env: NodeJS.ProcessEnv): string {
+	const lines: string[] = [];
+	for (const key of Object.keys(env).sort()) {
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || ENV_SKIP.has(key)) continue;
+		const value = env[key];
+		if (value === undefined) continue;
+		lines.push(`export ${key}=${shellQuote(value)}`);
+	}
+	return lines.join("\n");
+}
+
+export interface LauncherScriptOptions {
+	node: string;
+	entry: string;
+	cwd: string;
+	/** Environment to restore inside the new window (defaults to none). */
+	env?: NodeJS.ProcessEnv;
+	/** Extra Pi CLI flags inserted before `--` (e.g. `--provider P --model M --thinking T`). */
+	piFlags?: string[];
+}
+
+/**
+ * The launcher script dropped into the temp dir. Reads the question from `$2`
+ * (a file) so arbitrary multi-line text needs no quoting, re-exports the given
+ * environment, runs Pi with absolute `node`/entry paths, and removes its own
+ * temp dir once Pi exits. A missing cwd or a failed run pauses so the error is
+ * readable in the window rather than vanishing.
+ */
+export function buildLauncherScript(opts: LauncherScriptOptions): string {
 	const lines = [
 		"#!/bin/sh",
 		"# Generated by the pi-plugins /btw extension; self-deletes when done.",
 		'dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
-		`cd ${shellQuote(opts.cwd)} || exit 1`,
-	];
-	if (opts.path) lines.push(`export PATH=${shellQuote(opts.path)}:"$PATH"`);
-	lines.push(
-		`${shellQuote(opts.node)} ${shellQuote(opts.entry)} --fork "$1" -- "$(cat "$2")"`,
-		"status=$?",
-		'if [ "$status" -ne 0 ]; then',
-		`\tprintf '\\nbtw: pi exited with status %s\\n' "$status" >&2`,
+		"pause() {",
+		"\tprintf '\\nbtw: %s\\n' \"$1\" >&2",
 		"\tprintf 'Press Enter to close…' >&2",
 		"\tread -r _ || true",
+		"}",
+	];
+	if (opts.env) {
+		const exports = buildEnvExports(opts.env);
+		if (exports.length > 0) lines.push(exports);
+	}
+	const flags = opts.piFlags && opts.piFlags.length > 0 ? ` ${opts.piFlags.map(shellQuote).join(" ")}` : "";
+	const cwdError = shellQuote(`working directory not found: ${opts.cwd}`);
+	lines.push(
+		`cd ${shellQuote(opts.cwd)} || { pause ${cwdError}; rm -rf -- "$dir"; exit 1; }`,
+		`${shellQuote(opts.node)} ${shellQuote(opts.entry)} --fork "$1"${flags} -- "$(cat "$2")"`,
+		"status=$?",
+		'if [ "$status" -ne 0 ]; then',
+		'\tpause "pi exited with status $status"',
 		"fi",
 		'rm -rf -- "$dir"',
 		'exit "$status"',
@@ -132,13 +183,23 @@ export function buildLauncherScript(opts: { node: string; entry: string; cwd: st
 	return `${lines.join("\n")}\n`;
 }
 
+/** True when `path` exists and is executable by this process. */
+function isExecutable(path: string): boolean {
+	try {
+		accessSync(path, constants.X_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /** Locate an executable on `PATH` (or an explicit path). */
 export function findExecutable(name: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
-	if (name.includes("/") || isAbsolute(name)) return existsSync(name) ? name : undefined;
+	if (name.includes("/") || isAbsolute(name)) return isExecutable(name) ? name : undefined;
 	for (const dir of (env.PATH ?? "").split(delimiter)) {
 		if (!dir) continue;
 		const candidate = join(dir, name);
-		if (existsSync(candidate)) return candidate;
+		if (isExecutable(candidate)) return candidate;
 	}
 	return undefined;
 }
@@ -162,19 +223,27 @@ function resolveExisting(spec: string | undefined, env: NodeJS.ProcessEnv): stri
 	}
 }
 
+/** Extensions `node` cannot execute directly; skip such a self-entry. */
+const NON_RUNNABLE_ENTRY = /\.(ts|tsx|mts|cts)$/i;
+
+/** This process's own entry, unless it is TypeScript or missing. */
+function resolveSelfEntry(env: NodeJS.ProcessEnv): string | undefined {
+	const self = process.argv[1];
+	if (!self || NON_RUNNABLE_ENTRY.test(self)) return undefined;
+	return resolveExisting(self, env);
+}
+
 /**
  * Absolute node + Pi entry paths for the launcher script. `$PI_BTW_PI` wins,
- * then this process's own entry (`process.argv[1]`), then `pi` on `PATH`.
- * Absolute paths are required because terminal servers often spawn commands
- * with a `PATH` that lacks nvm/bun-installed binaries.
+ * then this process's own entry (`process.argv[1]`, skipped when TypeScript),
+ * then `pi` on `PATH`. Absolute paths are required because terminal servers
+ * often spawn commands with a `PATH` that lacks nvm/bun-installed binaries.
  */
 export function resolvePiLaunch(env: NodeJS.ProcessEnv = process.env): PiLaunch | undefined {
 	const node = process.execPath;
 	if (!node || !existsSync(node)) return undefined;
 	const entry =
-		resolveExisting(env[BTW_PI_ENV]?.trim(), env) ??
-		resolveExisting(process.argv[1], env) ??
-		resolveExisting(DEFAULT_PI, env);
+		resolveExisting(env[BTW_PI_ENV]?.trim(), env) ?? resolveSelfEntry(env) ?? resolveExisting(DEFAULT_PI, env);
 	if (!entry) return undefined;
 	return { node, entry };
 }
@@ -323,8 +392,25 @@ export const TERMINAL_LAUNCHERS: Launcher[] = [
 ];
 
 /**
- * Pick a launcher: explicit `$PI_BTW_LAUNCH`, then tmux, then the first
- * detected terminal candidate, then macOS Terminal.app.
+ * Best-effort id of the terminal this process runs inside, from markers the
+ * popular emulators export. Preferring "open a window in *this* terminal"
+ * avoids surprising the user by hijacking an unrelated emulator, and sidesteps
+ * the long-lived terminal-server environment on machines with many terminals.
+ */
+export function detectCurrentTerminal(env: NodeJS.ProcessEnv): string | undefined {
+	if (env.KITTY_WINDOW_ID || env.KITTY_PID || env.TERM === "xterm-kitty") return "kitty";
+	if (env.WEZTERM_PANE || env.WEZTERM_EXECUTABLE || env.TERM_PROGRAM === "WezTerm") return "wezterm";
+	if (env.ALACRITTY_WINDOW_ID || env.ALACRITTY_LOG) return "alacritty";
+	if (env.GHOSTTY_RESOURCES_DIR || env.TERM_PROGRAM === "ghostty" || env.TERM === "xterm-ghostty") return "ghostty";
+	if (env.KONSOLE_VERSION) return "konsole";
+	if (env.GNOME_TERMINAL_SERVICE || env.GNOME_TERMINAL_SCREEN) return "gnome-terminal";
+	if (env.TERM_PROGRAM === "Apple_Terminal" || env.TERM_PROGRAM === "iTerm.app") return "macos-terminal";
+	return undefined;
+}
+
+/**
+ * Pick a launcher: explicit `$PI_BTW_LAUNCH`, then tmux, then the terminal we
+ * are running inside, then the first detected candidate, then macOS Terminal.app.
  */
 export function selectLauncher(
 	env: NodeJS.ProcessEnv,
@@ -344,6 +430,14 @@ export function selectLauncher(
 		};
 	}
 	if (env.TMUX && has("tmux")) return TMUX_LAUNCHER;
+	const current = detectCurrentTerminal(env);
+	if (current === "macos-terminal") {
+		if (platform === "darwin" && has("osascript")) return MACOS_LAUNCHER;
+	}
+	if (current) {
+		const preferred = TERMINAL_LAUNCHERS.find((launcher) => launcher.id === current);
+		if (preferred && has(preferred.bin)) return preferred;
+	}
 	for (const launcher of TERMINAL_LAUNCHERS) {
 		if (has(launcher.bin)) return launcher;
 	}
@@ -360,11 +454,23 @@ export interface LaunchRequest {
 	question: string;
 	cwd: string;
 	env?: NodeJS.ProcessEnv;
+	/** Pi CLI flags pinning the fork (e.g. `--provider/--model/--thinking`). */
+	piFlags?: string[];
 	/** Injectable for tests; defaults to `node:child_process.spawn`. */
 	spawnImpl?: typeof spawn;
 }
 
 export type LaunchOutcome = { ok: true; launcher: string } | { ok: false; error: string };
+
+/** Best-effort recursive removal of a temp dir (the launcher self-deletes on success). */
+function removeDir(dir: string | undefined): void {
+	if (!dir) return;
+	try {
+		rmSync(dir, { recursive: true, force: true });
+	} catch {
+		/* best effort */
+	}
+}
 
 /** Write the temp launcher, choose a terminal, and spawn the forked Pi window. */
 export function launchBtw(request: LaunchRequest): LaunchOutcome {
@@ -386,10 +492,17 @@ export function launchBtw(request: LaunchRequest): LaunchOutcome {
 		writeFileSync(questionFile, `${question}\n`, "utf8");
 		writeFileSync(
 			scriptFile,
-			buildLauncherScript({ node: pi.node, entry: pi.entry, cwd: request.cwd, path: env.PATH }),
+			buildLauncherScript({
+				node: pi.node,
+				entry: pi.entry,
+				cwd: request.cwd,
+				env,
+				piFlags: request.piFlags,
+			}),
 			"utf8",
 		);
-		chmodSync(scriptFile, 0o755);
+		// Owner-only: the script re-exports the full environment (API keys included).
+		chmodSync(scriptFile, 0o700);
 
 		const { command, args } = launcher.build({
 			script: scriptFile,
@@ -399,19 +512,24 @@ export function launchBtw(request: LaunchRequest): LaunchOutcome {
 			title: deriveTitle(question),
 		});
 		const child = spawnFn(command, args, { detached: true, stdio: "ignore", cwd: request.cwd });
+		// Attach first: an unhandled 'error' event would crash Pi, and a failed spawn
+		// emits it asynchronously with no pid.
 		child.on("error", () => {
-			// Best-effort: the terminal binary vanished between detection and spawn.
+			// Async failure (e.g. the terminal binary vanished): reclaim the dir, since
+			// the launcher script will never run to self-delete it.
+			removeDir(dir);
 		});
+		if (child.pid === undefined) {
+			removeDir(dir);
+			return {
+				ok: false,
+				error: `btw: could not start "${command}" — check ${BTW_LAUNCH_ENV} and that the terminal is installed`,
+			};
+		}
 		child.unref();
 		return { ok: true, launcher: launcher.id };
 	} catch (err) {
-		if (dir) {
-			try {
-				rmSync(dir, { recursive: true, force: true });
-			} catch {
-				/* best effort */
-			}
-		}
+		removeDir(dir);
 		return { ok: false, error: err instanceof Error ? err.message : String(err) };
 	}
 }
@@ -425,6 +543,14 @@ export function registerBtw(pi: ExtensionAPI): void {
 		description: "Ask a side question in a forked copy of this session, opened in a new window",
 		handler: (args: string, ctx: ExtensionCommandContext) => handleBtw(args, ctx),
 	});
+}
+
+/** Flags that pin the forked Pi to this session's model and thinking level. */
+export function buildPiFlags(ctx: Pick<ExtensionCommandContext, "model" | "thinkingLevel">): string[] {
+	const flags: string[] = [];
+	if (ctx.model) flags.push("--provider", ctx.model.provider, "--model", ctx.model.id);
+	if (ctx.thinkingLevel) flags.push("--thinking", ctx.thinkingLevel);
+	return flags;
 }
 
 export async function handleBtw(args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -452,12 +578,13 @@ export async function handleBtw(args: string, ctx: ExtensionCommandContext): Pro
 	} catch {
 		sessionFile = undefined; // stale ctx after session replacement
 	}
-	if (!sessionFile) {
+	// The path is assigned before the first message is written, so check the file too.
+	if (!sessionFile || !existsSync(sessionFile)) {
 		ctx.ui.notify(MSG_NO_SESSION, "error");
 		return;
 	}
 
-	const result = launchBtw({ sessionFile, question, cwd: ctx.cwd });
+	const result = launchBtw({ sessionFile, question, cwd: ctx.cwd, piFlags: buildPiFlags(ctx) });
 	if (result.ok) {
 		ctx.ui.notify(`btw: forked session opened in a new window (${result.launcher})`, "info");
 	} else {
