@@ -6,7 +6,7 @@
  * to finish what it planned. When a run settles (`agent_settled`: after
  * retries, auto-compaction, and queued follow-ups — the point where Pi will
  * not continue on its own) this extension inspects the list and, if any
- * task is still open, injects one follow-up user message telling the model to
+ * task is still open, injects a follow-up user message telling the model to
  * reconcile: mark already-done work completed, finish work that is still
  * outstanding, or say what it is blocked on.
  *
@@ -19,12 +19,20 @@
  * extension replays the same branch, so it needs no shared state, no fork
  * bump, and it survives `/reload` and compaction exactly like the overlay.
  *
- * Loop safety — exactly one nudge per user turn:
- * - A session that has been nudged is remembered until the next non-extension
- *   input (extension-sent messages, including our own injected nudge, are
- *   tagged `source: "extension"` and do not clear it), the list goes clean, a
- *   `/tree` navigation changes the branch, or the session shuts down. Slash
- *   commands are dispatched before the `input` event, so they do not clear it.
+ * Loop safety — nudge only while the model keeps making progress and is not
+ * asking for input; there is no per-turn or per-session cap:
+ * - Each settle is classified. The model "worked" if the branch gained a tool
+ *   call/result (or the todo snapshot changed) since the previous nudge; it
+ *   "asked" if the final assistant message carries no tool calls and either
+ *   the explicit `Awaiting input:` marker or (when `detectQuestions` is on) a
+ *   trailing question / awaiting phrase. A nudged model that stopped without
+ *   new work is left alone, and one that asked is not nudged again until a real
+ *   user reply arrives.
+ * - State is remembered until the next non-extension input (extension-sent
+ *   messages, including our own injected nudge, are tagged `source:
+ *   "extension"` and do not clear it), the list goes clean, a `/tree`
+ *   navigation changes the branch, or the session shuts down. Slash commands
+ *   are dispatched before the `input` event, so they do not clear it.
  * - A non-voluntary stop never nudges: user abort, exhausted error, or a
  *   deferred operation is not the model choosing to stop.
  * - Interactive TUI only. Headless/print sessions and subagents have nothing
@@ -35,7 +43,8 @@
  * `$PI_CODING_AGENT_DIR/todo-reconcile.json`):
  * {
  *   "enabled": true,
- *   "maxTasksShown": 10
+ *   "maxTasksShown": 10,
+ *   "detectQuestions": true
  * }
  */
 import { existsSync, readFileSync } from "node:fs";
@@ -51,7 +60,29 @@ export type Task = {
 	activeForm?: string;
 };
 
-type TodoSnapshot = { tasks: Task[] };
+export type TodoSnapshot = { tasks: Task[] };
+
+export type NudgeState = {
+	/** Whether a nudge was already sent in the current user turn. */
+	nudged: boolean;
+	/** Branch length at the last nudge; used to detect work done since. */
+	lastNudgeIndex: number;
+	/** Todo snapshot key at the last nudge; a change also counts as progress. */
+	lastNudgeTodoKey: string;
+	/** Latched when the model asked a question — stays silent until real input. */
+	awaitingInput: boolean;
+};
+
+export function newNudgeState(): NudgeState {
+	return { nudged: false, lastNudgeIndex: 0, lastNudgeTodoKey: "", awaitingInput: false };
+}
+
+export type AssistantContent = {
+	text: string;
+	hasToolCalls: boolean;
+};
+
+export type AssistantInfo = AssistantContent & { stopReason?: string };
 
 type BranchEntry = {
 	type?: string;
@@ -60,6 +91,7 @@ type BranchEntry = {
 		toolName?: string;
 		details?: unknown;
 		stopReason?: string;
+		content?: unknown;
 	};
 };
 
@@ -76,14 +108,29 @@ const MAX_FIELD_LEN = 200;
  */
 const NON_VOLUNTARY_STOP_REASONS = new Set(["aborted", "error", "deferred"]);
 
+/** Explicit marker a blocked model is asked to emit so we never nudge a question. */
+const AWAIT_MARKER_RE = /^\s*awaiting input\s*:/im;
+
+/**
+ * Conservative awaiting-input phrases. Only consulted on the tail of the
+ * final assistant message and only when `detectQuestions` is on.
+ */
+const AWAIT_PHRASE_RE =
+	/\b(?:awaiting (?:your )?input|waiting for (?:your|you)|need (?:your|more) (?:input|info|clarification|decision|approval)|please (?:confirm|clarify|let me know)|let me know (?:how|if|whether|which|what)|which (?:one|option|approach)|should i|do you want me to|would you like me to|can you (?:confirm|clarify|provide|tell me))\b/i;
+
+/** Tail length (chars) inspected for awaiting phrases, to avoid stale matches. */
+const AWAIT_TAIL_LEN = 400;
+
 type Config = {
 	enabled: boolean;
 	maxTasksShown: number;
+	detectQuestions: boolean;
 };
 
 const DEFAULTS: Config = {
 	enabled: true,
 	maxTasksShown: DEFAULT_MAX_TASKS_SHOWN,
+	detectQuestions: true,
 };
 
 function configPath(): string {
@@ -107,6 +154,7 @@ function loadConfig(): Config {
 	if (typeof raw.maxTasksShown === "number" && Number.isInteger(raw.maxTasksShown) && raw.maxTasksShown > 0) {
 		cfg.maxTasksShown = raw.maxTasksShown;
 	}
+	if (typeof raw.detectQuestions === "boolean") cfg.detectQuestions = raw.detectQuestions;
 	return cfg;
 }
 
@@ -134,6 +182,38 @@ export function latestTodoSnapshot(branch: Iterable<unknown>): TodoSnapshot | un
 	return result;
 }
 
+/** Stable key of the open/closed state of the list; a change means the model used `todo`. */
+export function todoSnapshotKey(snapshot: TodoSnapshot | undefined): string {
+	if (!snapshot) return "";
+	return snapshot.tasks.map((t) => `${t.id}:${t.status}`).join("|");
+}
+
+/** Extract assistant text and whether the message invoked any tool. */
+export function readAssistantContent(content: unknown): AssistantContent {
+	if (typeof content === "string") return { text: content, hasToolCalls: false };
+	if (!Array.isArray(content)) return { text: "", hasToolCalls: false };
+	const texts: string[] = [];
+	let hasToolCalls = false;
+	for (const part of content) {
+		if (!part || typeof part !== "object") continue;
+		const p = part as { type?: unknown; text?: unknown };
+		if (p.type === "toolCall") hasToolCalls = true;
+		else if (p.type === "text" && typeof p.text === "string") texts.push(p.text);
+	}
+	return { text: texts.join("\n"), hasToolCalls };
+}
+
+/** Last assistant message with its text, tool-call flag, and stop reason. */
+export function lastAssistantInfo(branch: Iterable<unknown>): AssistantInfo | undefined {
+	const entries = Array.from(branch);
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const e = entries[i] as BranchEntry;
+		if (e?.type !== "message" || e.message?.role !== "assistant") continue;
+		return { ...readAssistantContent(e.message.content), stopReason: e.message.stopReason };
+	}
+	return undefined;
+}
+
 /** Stop reason of the last assistant message in the branch (scan from the end). */
 export function lastAssistantStopReason(branch: Iterable<unknown>): string | undefined {
 	const entries = Array.from(branch);
@@ -147,6 +227,71 @@ export function lastAssistantStopReason(branch: Iterable<unknown>): string | und
 /** Whether the settle was not the model choosing to stop (abort / error / deferred). */
 export function isNonVoluntaryStop(stopReason: string | undefined): boolean {
 	return stopReason !== undefined && NON_VOLUNTARY_STOP_REASONS.has(stopReason);
+}
+
+/** Explicit, deterministic blocked signal requested by the nudge prompt. */
+export function hasAwaitMarker(text: string): boolean {
+	return AWAIT_MARKER_RE.test(text);
+}
+
+/** Last non-empty line ends with a question mark (ASCII or fullwidth). */
+function lastLineEndsWithQuestion(text: string): boolean {
+	const lines = text.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i].trim();
+		if (!line) continue;
+		return /[?？]["'”’)\]]*\s*$/.test(line);
+	}
+	return false;
+}
+
+/**
+ * Whether the final assistant message is addressed to the user rather than a
+ * stopped worker. A message with tool calls is mid-work by definition.
+ */
+export function isAwaitingInput(info: AssistantInfo, detectQuestions: boolean): boolean {
+	if (info.hasToolCalls) return false;
+	if (hasAwaitMarker(info.text)) return true;
+	if (!detectQuestions) return false;
+	if (lastLineEndsWithQuestion(info.text)) return true;
+	return AWAIT_PHRASE_RE.test(info.text.slice(-AWAIT_TAIL_LEN));
+}
+
+/**
+ * Whether the model did anything since `index`: a new tool call/result, or the
+ * branch changed underneath us (compaction/tree). User messages — including
+ * our own injected nudge — do not count.
+ */
+export function hasProgressSince(entries: readonly unknown[], index: number): boolean {
+	if (index < 0 || index > entries.length) return true;
+	for (let i = index; i < entries.length; i++) {
+		const e = entries[i] as BranchEntry;
+		if (e?.type !== "message") continue;
+		const msg = e.message;
+		if (msg?.role === "toolResult") return true;
+		if (msg?.role === "assistant" && readAssistantContent(msg.content).hasToolCalls) return true;
+	}
+	return false;
+}
+
+export type SettleAction = "nudge" | "awaiting" | "latched" | "no-progress";
+
+/**
+ * The decision table: nudge while the model keeps working; stay silent once it
+ * asks (latched until real input) or when a nudged model stopped without new
+ * progress. There is no cap — a model that keeps working keeps being nudged.
+ */
+export function evaluateSettle(opts: {
+	state: NudgeState;
+	assistant: AssistantInfo | undefined;
+	progressed: boolean;
+	detectQuestions: boolean;
+}): SettleAction {
+	const { state } = opts;
+	if (state.awaitingInput) return "latched";
+	if (opts.assistant && isAwaitingInput(opts.assistant, opts.detectQuestions)) return "awaiting";
+	if (state.nudged && !opts.progressed) return "no-progress";
+	return "nudge";
 }
 
 /**
@@ -183,7 +328,7 @@ export function buildNudge(active: Task[], maxTasksShown: number): string {
 		"Unfinished tasks:",
 		...lines,
 		"",
-		"For each task: if the work is already done, mark it completed with the todo tool. If it still needs doing, finish it and then mark it completed. If you are blocked or need my input, say so explicitly and leave the task as it is. Do not redo completed work.",
+		"For each task: if the work is already done, mark it completed with the todo tool. If it still needs doing, finish it and then mark it completed. If you need my input before you can continue, end your reply with a line beginning `Awaiting input:` followed by a short reason, and leave the task as it is. Do not redo completed work.",
 	].join("\n");
 }
 
@@ -193,11 +338,11 @@ function isStaleCtxError(e: unknown): boolean {
 }
 
 export default function (pi: ExtensionAPI) {
-	// Sessions nudged during the current user turn — cleared by the next real
-	// user input, a clean list, a `/tree` navigation, or session shutdown.
+	// Per-session nudge state for the current user turn — cleared by the next
+	// real user input, a clean list, a `/tree` navigation, or session shutdown.
 	// In-memory by design: `/reload` recreating it can cost at most one extra
 	// nudge per turn, which is harmless.
-	const nudged = new Set<string>();
+	const states = new Map<string, NudgeState>();
 
 	/** Session id, or undefined when the ctx is stale/unknown. */
 	function sessionId(ctx: ExtensionContext): string | undefined {
@@ -208,9 +353,9 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function clearNudge(ctx: ExtensionContext): void {
+	function clearState(ctx: ExtensionContext): void {
 		const id = sessionId(ctx);
-		if (id) nudged.delete(id);
+		if (id) states.delete(id);
 	}
 
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -225,22 +370,44 @@ export default function (pi: ExtensionAPI) {
 			const id = sessionId(ctx);
 			if (!id) return; // cannot key the guard reliably — do not risk cross-session suppression
 
-			const branch = ctx.sessionManager.getBranch() as Iterable<unknown>;
-			const snapshot = latestTodoSnapshot(branch);
-			if (!snapshot) return;
+			const entries = Array.from(ctx.sessionManager.getBranch() as Iterable<unknown>);
+			const snapshot = latestTodoSnapshot(entries);
+			if (!snapshot) {
+				states.delete(id);
+				return;
+			}
 
 			const active = snapshot.tasks.filter(isActive);
 			if (active.length === 0) {
-				nudged.delete(id); // list is clean — arm the next turn
+				states.delete(id); // list is clean — arm the next turn
 				return;
 			}
 
 			// Abort/error/deferred is not the model choosing to stop.
-			if (isNonVoluntaryStop(lastAssistantStopReason(branch))) return;
-			if (nudged.has(id)) return; // one nudge per user turn
-			nudged.add(id);
+			if (isNonVoluntaryStop(lastAssistantStopReason(entries))) return;
 
-			pi.sendUserMessage(buildNudge(active, cfg.maxTasksShown));
+			const state = states.get(id) ?? newNudgeState();
+			const todoKey = todoSnapshotKey(snapshot);
+			const progressed =
+				state.nudged && (hasProgressSince(entries, state.lastNudgeIndex) || todoKey !== state.lastNudgeTodoKey);
+
+			const action = evaluateSettle({
+				state,
+				assistant: lastAssistantInfo(entries),
+				progressed,
+				detectQuestions: cfg.detectQuestions,
+			});
+
+			if (action === "nudge") {
+				pi.sendUserMessage(buildNudge(active, cfg.maxTasksShown));
+				state.nudged = true;
+				state.lastNudgeIndex = entries.length;
+				state.lastNudgeTodoKey = todoKey;
+				state.awaitingInput = false;
+			} else if (action === "awaiting") {
+				state.awaitingInput = true; // latch: no more nudges until the user replies
+			}
+			states.set(id, state);
 		} catch (e) {
 			// A missed nudge is harmless — never break the settled event. Stale ctx
 			// is expected during replacement; anything else is worth surfacing.
@@ -254,16 +421,16 @@ export default function (pi: ExtensionAPI) {
 	// injected message arrives with `source: "extension"` and must not.
 	pi.on("input", async (event, ctx) => {
 		if (event.source === "extension") return;
-		clearNudge(ctx);
+		clearState(ctx);
 	});
 
-	// `/tree` navigation swaps the branch (same session id, new snapshot), so a
-	// flag set on the old branch must not suppress a nudge on the new one.
+	// `/tree` navigation swaps the branch (same session id, new snapshot), so
+	// state set on the old branch must not suppress a nudge on the new one.
 	pi.on("session_tree", async (_event, ctx) => {
-		clearNudge(ctx);
+		clearState(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		clearNudge(ctx);
+		clearState(ctx);
 	});
 }
