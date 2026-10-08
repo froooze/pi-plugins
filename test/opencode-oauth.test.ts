@@ -621,12 +621,13 @@ test("projectConsoleModels routes openai() models to the Responses API", () => {
 	assert.equal(muse!.headers?.[OPENCODE_ORG_HEADER], "org-1");
 });
 
-test("projectConsoleModels uses a per-model apiUrl override", () => {
+test("projectConsoleModels uses a per-model apiUrl override (opencode/Zen)", () => {
 	const credential: OpenCodeCredential = {
 		access: "a",
 		refresh: "r",
 		expires: Date.now() + 1000,
 		console: {
+			provider: "opencode",
 			apiUrl: OPENCODE_INFERENCE_BASE_URL,
 			headers: {},
 			models: ["claude-fable-5"],
@@ -635,9 +636,71 @@ test("projectConsoleModels uses a per-model apiUrl override", () => {
 			},
 		},
 	};
-	const projected = projectConsoleModels([model("claude-fable-5")], credential);
+	const projected = projectConsoleModels([model("claude-fable-5")], credential, "opencode");
 	assert.equal(projected[0]!.api, "anthropic-messages");
-	assert.equal(projected[0]!.baseUrl, "https://opencode.ai/inference/anthropic/v1");
+	// Pi's Anthropic SDK appends `/v1/messages`, so the console's AI-SDK base
+	// (`…/anthropic/v1`) must lose its version segment or the request hits
+	// `…/anthropic/v1/v1/messages` and the gateway answers 404 with no body.
+	assert.equal(projected[0]!.baseUrl, "https://opencode.ai/inference/anthropic");
+});
+
+test("projectConsoleModels keeps non-Anthropic bases verbatim", () => {
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: Date.now() + 1000,
+		console: {
+			apiUrl: OPENCODE_GO_INFERENCE_BASE_URL,
+			headers: {},
+			models: ["deepseek-v4.1-flash", "muse-spark-1.3-contributor"],
+			modelRoutes: {
+				"muse-spark-1.3-contributor": {
+					api: "openai-responses",
+					apiUrl: "https://opencode.ai/inference/go/openai/v1",
+				},
+			},
+		},
+	};
+	const projected = projectConsoleModels(
+		[model("deepseek-v4.1-flash"), model("muse-spark-1.3-contributor")],
+		credential,
+		"opencode-go",
+	);
+	assert.equal(projected[0]!.baseUrl, OPENCODE_GO_INFERENCE_BASE_URL);
+	assert.equal(projected[1]!.api, "openai-responses");
+	assert.equal(projected[1]!.baseUrl, "https://opencode.ai/inference/go/openai/v1");
+});
+
+test("projectConsoleModels trims a synthesized Anthropic route", () => {
+	const credential: OpenCodeCredential = {
+		access: "a",
+		refresh: "r",
+		expires: Date.now() + 1000,
+		console: {
+			apiUrl: OPENCODE_GO_INFERENCE_BASE_URL,
+			headers: {},
+			models: ["claude-haiku-5-5"],
+			modelRoutes: {
+				"claude-haiku-5-5": {
+					api: "anthropic-messages",
+					apiUrl: "https://opencode.ai/inference/go/anthropic/v1",
+				},
+			},
+			definitions: {
+				"claude-haiku-5-5": {
+					name: "Claude Haiku 5.5",
+					reasoning: true,
+					input: ["text"],
+					cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
+			},
+		},
+	};
+	const projected = projectConsoleModels([], credential, "opencode-go");
+	assert.equal(projected[0]!.api, "anthropic-messages");
+	assert.equal(projected[0]!.baseUrl, "https://opencode.ai/inference/go/anthropic");
 });
 
 test("parseConsoleProjection falls back to the first provider with an api", () => {

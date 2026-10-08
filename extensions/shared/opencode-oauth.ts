@@ -811,6 +811,21 @@ export function mergeConsoleProjection(
 }
 
 /**
+ * Resolve the base URL Pi's wire client should use for a console route.
+ *
+ * Console `provider.api` values are AI-SDK style: the Anthropic entry is
+ * `…/anthropic/v1` and the AI SDK appends only `/messages`. Pi's
+ * `anthropic-messages` client is the official Anthropic SDK, which appends
+ * `/v1/messages`, so passing that base through verbatim yields
+ * `…/anthropic/v1/v1/messages` and the gateway answers 404 with no body. Trim
+ * the trailing version segment so the SDK rebuilds the intended path.
+ */
+function consoleRouteBaseUrl(api: Api, apiUrl: string): string {
+	if (api !== "anthropic-messages") return apiUrl;
+	return apiUrl.replace(/\/v1\/?$/, "");
+}
+
+/**
  * Project Pi's built-in `opencode`/`opencode-go` catalog onto the console
  * account's inference endpoint.
  *
@@ -864,10 +879,11 @@ export function projectConsoleModels(
 		.filter((model) => !allowed || allowed.has(model.id))
 		.map((model) => {
 			const route = active?.modelRoutes?.[model.id];
+			const api = route?.api ?? defaultApi;
 			return {
 				...model,
-				api: route?.api ?? defaultApi,
-				baseUrl: route?.apiUrl ?? apiUrl,
+				api,
+				baseUrl: consoleRouteBaseUrl(api, route?.apiUrl ?? apiUrl),
 				headers: { ...(model.headers ?? {}), ...headers },
 			};
 		});
@@ -879,12 +895,13 @@ export function projectConsoleModels(
 			const definition = active.definitions[id];
 			if (!definition) continue;
 			const route = active.modelRoutes?.[id];
+			const api = route?.api ?? defaultApi;
 			projected.push({
 				id,
 				name: definition.name ?? id,
-				api: route?.api ?? defaultApi,
+				api,
 				provider,
-				baseUrl: route?.apiUrl ?? apiUrl,
+				baseUrl: consoleRouteBaseUrl(api, route?.apiUrl ?? apiUrl),
 				reasoning: definition.reasoning,
 				input: [...definition.input],
 				cost: { ...definition.cost },
