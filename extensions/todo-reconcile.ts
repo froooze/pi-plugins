@@ -323,12 +323,12 @@ export function buildNudge(active: Task[], maxTasksShown: number): string {
 	if (hidden > 0) lines.push(`- …and ${hidden} more`);
 
 	return [
-		"Your turn ended, but the todo list still has unfinished work. Reconcile it instead of stopping.",
+		"Your turn ended with unfinished work — reconcile it before stopping.",
 		"",
 		"Unfinished tasks:",
 		...lines,
 		"",
-		"For each task: if the work is already done, mark it completed with the todo tool. If it still needs doing, finish it and then mark it completed. If you need my input before you can continue, end your reply with a line beginning `Awaiting input:` followed by a short reason, and leave the task as it is. Do not redo completed work.",
+		"Mark already-done work completed with the todo tool; finish the rest, then mark each completed. If you need my input, end with `Awaiting input:` and a short reason, leaving the task open.",
 	].join("\n");
 }
 
